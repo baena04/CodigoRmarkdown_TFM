@@ -1,0 +1,3036 @@
+---
+title: "Migración de la población de Guatemala"
+author: "Javier Ojeda Baena"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+---
+
+```{r Setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, include = FALSE}
+set.seed(0)
+```
+
+```{r, include = FALSE}
+libraries <- c("rprojroot", "readr", "ggplot2", "dplyr", "psych", 
+               "pheatmap", "factoextra", "MASS", "pscl", 
+               "ResourceSelection", "pROC", "nnet", "caret",
+               "rrcov", "stringr")
+
+for (library_name in libraries) {
+  if (!requireNamespace(library_name, quietly = TRUE)) {
+    install.packages(library_name)
+  }
+}
+
+lapply(libraries, library, character.only = TRUE)
+```
+
+```{r Funciones, include = FALSE}
+# Data treatment
+
+replace_missing_with_na <- function(data, missing_value) {
+  data[] <- lapply(data, function(column) {
+    column[column == missing_value] <- NA
+    return(column)
+  })
+  return(data)
+}
+
+percentage_na <- function(data) {
+  total_na <- sum(is.na(data))
+  total_values <- ncol(data) * nrow(data)
+  percentage_total_na <- (total_na / total_values) * 100
+  
+  na_percentage_by_column <- sapply(data, function(column) {
+    sum(is.na(column)) / length(column) * 100
+  })
+  
+  cat("Total percentage of NA in the dataframe:", round(percentage_total_na, 2), "%\n")
+  
+  # Optionally return results for further use
+  list(
+    total_percentage_na = percentage_total_na,
+    column_wise_na = na_percentage_by_column
+  )
+}
+
+mode <- function(x) {
+  unique_x <- unique(x)
+  unique_x[which.max(tabulate(match(x, unique_x)))]
+}
+
+replace_with_mode <- function(data) {
+  modified_data <- data
+  for (column in 1:ncol(modified_data)) {
+    column_data <- modified_data[[column]]
+    column_mode <- mode(column_data[!is.na(column_data)])
+    modified_data[[column]][is.na(column_data)] <- column_mode
+  }
+  return(modified_data)
+}
+
+remove_columns <- function(data, columns) {
+  if (!is.data.frame(data)) {
+    stop("The 'data' argument must be a dataframe.")
+  }
+  
+  if (!all(columns %in% colnames(data))) {
+    stop("Some specified columns are not in the dataframe.")
+  }
+  
+  result <- data[, !(colnames(data) %in% columns)]
+  return(result)
+}
+
+remove_rows <- function(data, rows) {
+  if (!is.data.frame(data)) {
+    stop("The 'data' argument must be a dataframe.")
+  }
+  
+  if (!is.numeric(rows)) {
+    stop("The 'rows' argument must be a numeric vector.")
+  }
+  
+  result <- data[-rows, , drop = TRUE]
+  rownames(result) <- seq_len(nrow(result))
+  return(result)
+}
+
+non_numeric_columns <- function(data) {
+  return(names(data)[!sapply(data, is.numeric)])
+}
+
+rename_columns <- function(data, new_names) {
+  if (!is.data.frame(data)) {
+    stop("The provided object is not a dataframe.")
+  }
+  
+  if (length(new_names) != ncol(data)) {
+    stop("The length of 'new_names' must match the number of columns in the dataframe.")
+  }
+  
+  colnames(data) <- new_names
+  return(data)
+}
+
+classify_into_intervals <- function(dataframe, variable, num_classes) {
+  if (!variable %in% names(dataframe)) {
+    stop("The specified variable does not exist in the dataframe.")
+  }
+  
+  values <- dataframe[[variable]]
+  
+  min_val <- min(values, na.rm = TRUE)
+  max_val <- max(values, na.rm = TRUE)
+  
+  breaks <- seq(min_val, max_val, length.out = num_classes + 1)
+  
+  class_marks <- (breaks[-1] + breaks[-length(breaks)]) / 2
+  
+  dataframe[[paste0(variable, "_classes")]] <- cut(
+    values,
+    breaks = breaks,
+    labels = class_marks,
+    include.lowest = TRUE
+  )
+  
+  dataframe[[paste0(variable, "_classes")]] <- as.numeric(as.character(dataframe[[paste0(variable, "_classes")]]))
+  
+  return(dataframe)
+}
+
+# Plot
+
+plot_correlation_heatmap <- function(data) {
+  cor_matrix <- cor(data, use = "complete.obs")
+  num_vars <- ncol(cor_matrix)
+  max_plot_size <- 250
+  cell_size <- max_plot_size / num_vars
+  
+  dev.new(width = max_plot_size, height = max_plot_size)
+  
+  pheatmap(cor_matrix,
+           color = colorRampPalette(c("blue", "white", "red"))(100),
+           main = "Matriz de correlación",
+           display_numbers = FALSE,
+           cluster_rows = FALSE,
+           cluster_cols = FALSE,
+           fontsize = 12,
+           border_color = "grey",
+           show_rownames = TRUE,
+           show_colnames = TRUE,
+           legend = TRUE,
+           scale = "none",
+           cellwidth = cell_size,
+           cellheight = cell_size,
+           breaks = seq(-1, 1, length.out = 101),
+           legend_breaks = c(-1, 0, 1),
+           legend_labels = c("-1", "0", "1"),
+           legend_height = 0.5,
+           legend_position = "bottom"
+  )
+}
+
+plot_LDA <- function(x, predictions) {
+  lda_df <- data.frame(
+    LD1 = x[, 1],
+    Class = as.factor(predictions)
+  )
+  
+  ggplot(lda_df, aes(x = LD1, fill = Class)) +
+    geom_density(alpha = 0.5) +
+    labs(
+      title = "Resultados de Análisis discriminante lineal",
+      x = "LD1 (Discriminante)",
+      y = "Densidad"
+    ) +
+    scale_fill_manual(values = c("red", "blue"), labels = c("No migracíón", "Migración")) +
+    theme_minimal() +
+    theme(legend.position = "right")
+}
+
+plot_importance <- function(model, data, labels) {
+  coefs <- model$wts
+  predictors <- colnames(data)
+  importance <- coefs[1:length(predictors)]
+  
+  importance_df <- data.frame(
+    Variable = predictors,
+    Importance = importance
+  )
+  
+  importance_df <- importance_df[order(abs(importance_df$Importance), decreasing = TRUE), ]
+  
+  ggplot(importance_df, aes(x = reorder(Variable, Importance), y = Importance, fill = Importance > 0)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+      title = "Importancia de cada variable",
+      x = "Variables",
+      y = "Importancia"
+    ) +
+    scale_fill_manual(values = c("red", "blue"), labels = c("No migracíón", "Migración")) +
+    theme(legend.title = element_blank())
+}
+
+create_bar_diagram_gradient <- function(data, column, levels = NULL, labels = NULL, title, x_label, y_label) {
+  if (column %in% colnames(data)) {
+    if (is.null(levels)) {
+      levels <- unique(data[[column]])
+    }
+    if (is.null(labels)) {
+      labels <- levels
+    }
+    
+    filtered_data <- data[data[[column]] %in% levels, ]
+    
+    percent_data <- filtered_data %>%
+      group_by(.data[[column]]) %>%
+      summarise(count = n(), .groups = "drop") %>%
+      mutate(percentage = count / sum(count) * 100)
+    
+    wrapped_labels <- sapply(labels, function(x) paste(strwrap(x, width = 10), collapse = "\n"))
+    
+    ggplot(percent_data, aes(x = factor(.data[[column]], levels = levels, labels = wrapped_labels), y = count)) +
+      geom_bar(stat = "identity", aes(fill = count), color = "black") +
+      geom_text(aes(label = paste0(round(percentage, 1), "%")), vjust = -1) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1), 
+        plot.title = element_text(size = 14, hjust = 0.5, margin = margin(b = 10))
+      ) +
+      labs(title = title,
+           x = x_label,
+           y = y_label) +
+      scale_fill_gradient(low = "blue", high = "red", guide = "none") +
+      expand_limits(y = max(percent_data$count) * 1.2)
+  } else {
+    cat("The column", column, "doesn't exist in the dataframe.\n")
+  }
+}
+
+create_bar_chart <- function(data, option, labels, title, x, y, fill, max_title_length = 50, max_label_length = 15, percentages = TRUE) {
+  # Ajustar el título
+  title <- str_wrap(title, width = max_title_length)
+
+  # Ajustar etiquetas si están definidas
+  if (!is.null(labels)) {
+    labels <- sapply(labels, function(label) str_wrap(label, width = max_label_length))
+  }
+
+  # Crear el dataframe
+  if (is.null(labels)) {
+    df <- data.frame(
+      labels = data,
+      option = factor(option, levels = c(0, 1), labels = c("No migración", "Migración"))
+    )
+  } else {
+    df <- data.frame(
+      labels = factor(data, levels = sort(unique(data)), labels = labels),
+      option = factor(option, levels = c(0, 1), labels = c("No migración", "Migración"))
+    )
+  }
+
+  # Calcular los porcentajes condicionados dentro de cada categoría
+  df_summary <- df %>%
+    group_by(labels, option) %>%
+    summarise(count = n(), .groups = 'drop') %>%
+    group_by(labels) %>%
+    mutate(percentage = count / sum(count) * 100) %>%
+    ungroup()
+
+  # Crear el gráfico
+  plot <- ggplot(df_summary, aes(x = labels, y = count, fill = option)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = c("No migración" = "red", "Migración" = "blue")) +
+    labs(
+      title = title,
+      x = x,
+      y = y,
+      fill = fill
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1), 
+      plot.title = element_text(size = 14, hjust = 0.5, margin = margin(b = 10))
+    )
+
+  # Agregar etiquetas de porcentaje si percentages es TRUE
+  if (percentages) {
+    plot <- plot +
+      geom_text(aes(label = paste0(round(percentage, 1), "%")), 
+                position = position_dodge(width = 0.9), 
+                vjust = -0.5, size = 3)
+  }
+
+  return(plot)
+}
+
+# Validation
+
+accuracy <- function(predicted, actual) {
+  cat("Accuracy:", sum(predicted == actual) / length(actual) * 100, "%\n")
+}
+```
+
+# Base de datos
+
+## Lectura de los datos
+
+Leemos los datos del fichero *datos.csv*.
+
+```{r}
+file <- "datos.csv"
+data <- read.csv(file)
+data <- replace_missing_with_na(data, 999)
+```
+
+Mostramos la estructura del dataframe:
+
+```{r}
+str(data)
+```
+
+
+Mostramos los primeros cinco datos:
+
+```{r}
+head(data)
+```
+
+---
+
+
+
+
+
+
+
+
+
+
+
+
+# Tratamiento de los datos
+
+## Datos faltantes
+
+Antes de procesar los datos, verificaremos el porcentaje de valores faltantes (NAs) en el conjunto inicial.
+
+```{r}
+percentage_na(data)
+```
+
+Como el porcantaje de datos faltantes no supera el 5%, sustituiremos los valores faltantes con el valor más frecuente (la moda) y verificaremos nuevamente para asegurarnos de que no queden valores faltantes.
+
+```{r}
+data <- replace_with_mode(data)
+```
+
+```{r}
+percentage_na(data)
+```
+
+## Intención migratoria
+
+### Extracción del conjunto
+
+A continuación se muestra un diagrama de barras que muestra la población y la intención de migración:
+
+```{r}
+create_bar_diagram_gradient(data, "IM", levels = rev(seq(1:7)), labels = rev(c(
+  "Seguro",
+  "Probable",
+  "Ligeramente probable",
+  "Indeciso",
+  "Ligeramente improbable",
+  "Improbable",
+  "Imposible"
+  )),
+  "Posibilidad de migrar en el futuro",
+  "Intención migratoria",
+  "Número de individuos"
+)
+```
+
+Para trabajar con la intención migratoria, extraemos la columna correspondiente (**IM**) del conjunto de datos y la eliminamos del resto del dataframe.
+
+```{r}
+IM <- data$IM
+data <- remove_columns(data, c("IM"))
+```
+
+### Localización y eliminación de los indecisos
+
+Identificamos los registros de personas indecisas (valor **4** en **IM**) y los eliminamos del análisis para centrarlo en decisiones binarias.
+
+```{r}
+rdoubts <- which(IM == 4)
+IM <- subset(IM, IM != 4)
+```
+
+### Dicotomización
+
+Convertimos la variable **IM** en una variable binaria, donde los valores menores a 4 se recodifican como 1 (intención de migrar) y los mayores a 4 como 0 (no intención de migrar).
+
+```{r}
+IM[IM < 4] = 1
+IM[IM > 4] = 0
+```
+
+A continuación se muestra un diagrama donde se ve el resultado de la dicotomización:
+
+```{r}
+aux <- remove_rows(data, rdoubts)
+aux$IM <- IM
+create_bar_diagram_gradient(aux, "IM", levels = c(0, 1), labels = c(
+  "No migra",
+  "Migra"
+  ),
+  "Posibilidad de migrar en el futuro",
+  "Intención migratoria",
+  "Número de individuos"
+)
+```
+
+## Factorización de TERCOM, ZMV y FIES
+
+Las variables **TERCOM**, **ZMV** y **FIES** corresponden con preguntas categóricas de respuesta cerrada. Convertimos las columnas **TERCOM**, **ZMV** y **FIES** a factores numéricos para facilitar su análisis posterior.
+
+```{r}
+data$TERCOM <- as.numeric(as.factor(data$TERCOM))
+data$ZMV <- as.numeric(as.factor(data$ZMV))
+data$FIES <- as.numeric(as.factor(data$FIES))
+```
+
+## Borrado variables con respuesta abierta
+
+Identificamos y eliminamos las columnas que se corresponden con una pregunta abierta y que por su variabilidad no son relevantes para el análisis actual. En esta caso, coincide con las que son no numéricas.
+
+```{r}
+print(non_numeric_columns(data))
+data <- remove_columns(data, non_numeric_columns(data))
+``` 
+
+```{r}
+#columns <- c("EQU", "TELEQU", "TELENC")
+#print(columns)
+#data <- remove_columns(data, columns)
+``` 
+
+## Agrupación por capitales
+
+Primero, agrupamos las variables del conjunto de datos en categorías temáticas más amplias para facilitar el análisis.
+
+```{r, echo = TRUE}
+c1 <- c("TERDEP", "TERCOM", "TERMUN") # Lugar de residencia
+c2 <- c("ZMV") # Zona de características comunes
+c3 <- c("GEN1") # Género
+c4 <- c("EDAD") # Edad
+c5 <- c("IDIOMA1") # Idioma
+c6 <- c("ETNIA1") # Etnia
+c7 <- c("CH1", "CH2") # Nivel de estudios
+c8 <- c("OCUP1", "OCUP3") # Ocupación
+c9 <- c("SITCIV") # Estado civil
+c10 <- c("POB1", "POB2", "POB3", "POB4", "POB5", "POB6", "POB7", "POB8", "POB9", "POB10", "POB11", "POB12", "POB13", "POB14", "POB15") # Características del hogar
+c11 <- c("CFin1", "CFinCOVID") # Problemas en economía
+c12 <- c("DESAS1") # Desatres naturales
+c13 <- c("SPS") # Simple Poverty Scorecard
+c14 <- c("SA1", "SA2", "SA3", "SA4", "SA5", "SA6", "SA7", "SA8") # Alimentación
+c15 <- c("FIES") # Escala de experiencia de inseguridad alimentaria 
+c16 <- c("INST1", "INST2", "INST4") # Participación en proyectos
+c17 <- c("RAIZ1") # Tiempo de residencia en la comunidad
+c18 <- c("IMINT1") # Intención de migrar dentro de Guatemala
+c19 <- c("RED1", "REDPADRE", "REDMADRE", "REDESPOSO", "REDHERMANO", "REDHIJO", "REDOTRO1", "REDOTRO2") # Otro familiar viviendo en el extranjero
+c20 <- c("CFinREM1", "CFinREM2", "CFinREMCOVID") # Como afectan los problemas de contexto a la recepción de remesas
+c21 <- c("IMCOVID") # Como afecta el COVID a la intención de migrar
+c22 <- c("AT1", "AT2", "AT3", "AT4") # Atracción por otros paises (push)
+c23 <- c("EX1", "EX2", "EX3", "EX4", "EX5", "EX6") # Exclusión por la comunidad (push)
+c24 <- c("TRAN1", "TRAN2", "TRAN3", "TRAN4") # Temor a problemas que puedan surgir en/por la migración (pull)
+c25 <- c("ARR1", "ARR2", "ARR3", "ARR4", "ARR5", "ARR6", "ARR7", "ARR8", "ARR9", "ARR10") # Arraigo a la comunidad (pull)
+c26 <- c("CH3SAS") # Nivel de satisfacción con la vida
+c27 <- c("AUT1", "AUT2", "AUT3", "AUT4") # Nivel de autonomía/confianza
+c28 <- c("LC1", "LC2", "LC3", "LC4") # Locus control
+c29 <- c("OPT1", "OPT2", "OPT3", "OPT4", "OPT5", "OPT6", "OPT7", "OPT8") # Nivel de optimismo
+c30 <- c("REL1", "REL2") # Religión
+c31 <- c("VIOL1") # Violencia en la comunidad
+c32 <- c("MEN1") # Número de personas menores de 16 que habitan el hogar.
+```
+
+Cabe recalcar que las variables desde POB1 hasta POB15 se resumen en SPS, y además las variables desde SA1 hasta SA8 se resumen en la variable FIES, luego se tendrán en cuenta las variables resumidas para disminuir la dimensionalidad. A continuación las agrupamos por aspectos sociodemográficos, socioeconómicos, personalidad, aspectos sociales y remesas, factores push-pull, migratorios y problemas contextuales.
+
+```{r, echo = TRUE}
+csociodemograficos_culturales <- c(c1, c2, c3, c4, c5, c6, c7, c8, c9, c30)
+csocioeconomicos <- c(c11, c12, c13, c15, c16, c17, c31, c32)
+cpersonalidad <- c(c27, c28, c29, c26)
+csocial_remesas <- c(c19, c20)
+cpull_push <- c(c22, c23, c24, c25)
+```
+
+```{r}
+sociodemograficos_culturales <- data[, csociodemograficos_culturales]
+socioeconomicos <- data[, csocioeconomicos]
+personalidad <- data[, cpersonalidad]
+social_remesas <- data[, csocial_remesas]
+pull_push <- data[, cpull_push]
+```
+
+Este proceso organiza el conjunto de datos en categorías bien definidas, lo que facilitará el análisis en futuras etapas.
+
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Sociodemográficos y culturales
+
+En este bloque se va a realizar el estudio con las variables sociodemográficas y culturales. Estas son:
+
+- **TERDEP**: departamento en el que reside la persona encuestada.
+- **TERCOM**: comunidad en la que reside la persona encuestada.
+- **TERMUN**: municipio en el que reside la persona encuestada.
+- **ZMV**: zona de medios de vida.
+- **GEN1**: género de la persona encuestada (Masculino, Femenino, Otro).
+- **EDAD**: edad en años de la persona encuestada.
+- **IDIOMA1**: idioma en el que aprendió a hablar.
+- **ETNIA1**: etnia de la persona encuestada.
+- **CH1**: nivel educativo alcanzado por la persona.
+- **CH2**: nivel de escolaridad en curso.
+- **OCUP1**: ocupación principal de la persona.
+- **OCUP3**: otra ocupación relevante de la persona.
+- **SITCIV**: estado civil de la persona encuestada.
+- **REL1**: religión que profesa la persona.
+- **REL2**: importancia de la religión para la persona.
+
+El estudio se medirá en varias partes:
+
+- **Análisis de datos**: incluye gráficas relevantes, matrices de correlación y tests de validación como parte del análisis factorial.
+- **Análisis factorial**: para reducir la dimensionalidad del conjunto y facilitar los siguientes pasos.
+- **Regresión logística**: evaluación de cómo el conjunto de datos explica la intención migratoria.
+- **Análisis discriminante**: complementa a la regresión logística para observar las diferenciaciones principales.
+- **Red neuronal**: se aplicará una red neuronal para ver como ve esta la explicación de los factores del 
+
+```{r}
+current <- sociodemograficos_culturales
+```
+
+## Análisis de datos
+
+### Gráficas
+
+A continuación se muestran algunas gráficas que representan como se modela la población en las distintas variables y en función de la intención migratoria.
+
+```{r}
+aux <- remove_rows(current, rdoubts)
+```
+
+```{r}
+create_bar_chart(aux$GEN1, IM, 
+  c(
+    "Masculino",
+    "Femenino"
+    ),
+  "Diagrama de barras del género y la intención de migrar",
+  "Género", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+
+aux <- classify_into_intervals(aux, "EDAD", 5)
+
+create_bar_chart(aux$EDAD, IM, NULL,
+  "Diagrama de barras de la edad (sin agrupar) y la intención de migrar",
+  "Edad",
+  "Número de individuos",
+  "Intención de migrar",
+  percentages = FALSE
+)
+
+create_bar_chart(aux$EDAD_classes, IM,
+  c(
+    "De 18 a 27 años",
+    "De 28 a 37 años",
+    "De 38 a 47 años",
+    "De 48 a 57 años",
+    "De 58 a 67 años"
+  ),
+  "Diagrama de barras de la edad y la intención de migrar",
+  "Edad",
+  "Número de individuos",
+  "Intención de migrar"
+)
+
+create_bar_chart(aux$ETNIA1, IM, 
+  c(
+    "Otra",
+    "Maya",
+    "Ladina"
+  ), 
+  "Diagrama de barras de la etnia y la intención de migrar", 
+  "Etnia", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+
+create_bar_chart(aux$REL1, IM,
+  c(
+    "Católica",
+    "Evangélica",
+    "Otra",
+    "Ateo",
+    "No contesta"
+  ), 
+  "Diagrama de barras de la religión y la intención de migrar", 
+  "Religión", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+
+create_bar_chart(aux$SITCIV, IM, 
+  c(
+    "Soltero",
+    "Casado"
+  ), 
+  "Diagrama de barras del estado civil y la intención de migrar", 
+  "Estado civil", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+```
+
+### Matriz de correlación
+
+A continuación se muestra un mapa de calor que representa la matriz de correlación de las variables que vamos a estudiar:
+
+```{r}
+plot_correlation_heatmap(current)
+```
+
+### Tests para la validación de datos
+
+El análisis factorial requiere validar la adecuación de las variables para su inclusión en el modelo. Para ello, se realizan pruebas estadísticas específicas: el test de Kaiser-Meyer-Olkin (KMO) y el test de esfericidad de Bartlett, además de calcular las comunalidades de las variables. Este proceso asegura que las variables elegidas sean apropiadas y relevantes para identificar factores subyacentes.
+
+#### Test de Kaiser-Meyer-Olkin (KMO)
+
+El test KMO evalúa la adecuación de las variables para un análisis factorial. Un valor alto indica que las correlaciones parciales entre las variables son pequeñas, lo que sugiere que estas están correlacionadas y son aptas para formar factores comunes.
+
+```{r}
+kmo_result <- KMO(current)
+
+print(kmo_result)
+```
+
+El índice general de KMO (Overall MSA) obtenido es **0.66**, lo que sugiere que los datos son aceptables pero podrían mejorar. Además, se observan los valores individuales de MSA para cada variable. Entre las variables con valores bajos, destaca **OCUP3**, con un MSA de **0.44**, por debajo del umbral mínimo aceptable de **0.5**. Por ello, se ha decidido eliminar esta variable del análisis.
+
+```{r}
+current <- remove_columns(current, c("OCUP3"))
+```
+
+```{r}
+kmo_result <- KMO(current)
+
+print(kmo_result)
+```
+
+Tras la eliminación de **OCUP3**, se ha repetido el test de KMO. El índice general de MSA ha mejorado a **0.67**, y los valores individuales también muestran un ligero incremento, lo que confirma que la exclusión de **OCUP3** ha contribuido a mejorar la adecuación del modelo.
+
+#### Test de esfericidad de Bartlett
+
+El test de esfericidad de Bartlett evalúa si las variables están lo suficientemente correlacionadas como para justificar el análisis factorial.
+
+```{r}
+cor_matrix <- cor(current)
+n <- nrow(current)
+
+bartlett_result <- cortest.bartlett(cor_matrix, n)
+
+print(bartlett_result)
+```
+
+El resultado obtenido es altamente significativo (χ² = **1831.135**, p < **0.001**), lo que confirma que las correlaciones entre las variables son estadísticamente significativas y adecuadas para este análisis.
+
+### Comunalidades
+
+Las comunalidades representan la proporción de la varianza de cada variable que es explicada por los factores extraídos. Idealmente, estos valores deberían ser altos para que las variables contribuyan significativamente al modelo. Primero vamos a proceder a la elección del número de factores con análisis factorial paralelo.
+
+```{r}
+eigenvalues <- fa.parallel(current, fa = "fa")
+```
+
+Calculamos las comunalidades con **5** factores.
+
+```{r}
+fa_temp <- fa(current, nfactors = 5, rotate = "varimax", fm = "ml")
+print(fa_temp$communality)
+
+low_communalities <- names(which(fa_temp$communality < 0.4))
+print(low_communalities)
+```
+
+En el análisis realizado, se han identificado varias variables con comunalidades bajas, lo que indica que no están bien representadas en el modelo factorial. Las variables con las comunalidades más bajas fueron:  
+
+- **TERCOM (0.166)**: comunidad de residencia del encuestado.  
+- **TERMUN (0.07)**: municipio de residencia del encuestado.  
+- **REL2 (0.131)**: importancia de la religión.  
+
+De estas, se han eliminado **TERCOM** y **TERMUN** del análisis, ya que su información está contenida de forma más general en la variable **TERDEP** (Departamento). En cambio, se ha decidido conservar **REL2** a pesar de su baja comunalidad, debido a que no existe otra variable que represente su contenido.
+
+```{r}
+current <- remove_columns(current, c("TERCOM", "TERMUN"))
+```
+
+## Análisis factorial
+
+El análisis factorial tiene como objetivo reducir la dimensionalidad del conjunto de datos, permitiendo identificar factores subyacentes que explican las correlaciones entre las variables originales. A continuación, se presentan los pasos y resultados de este análisis.
+
+### Elección del número de factores
+
+Para determinar el número adecuado de factores, se realizó un análisis de componentes principales (PCA). Este método identifica la proporción de varianza explicada por cada componente principal, lo que ayuda a decidir cuántos factores incluir en el modelo.
+
+```{r}
+pca_result <- prcomp(current, center = TRUE, scale. = TRUE)
+summary(pca_result)
+```  
+
+Los resultados del PCA muestran que los primeros **4** factores explican el **59,28%** de la varianza acumulada. Este porcentaje se encuentra dentro del rango aceptable para estudios sociológicos, que suele situarse entre **50% y 60%**. Por lo tanto, se seleccionaron 4 factores para proceder con el análisis factorial.
+
+### Creación del modelo
+
+Con los **4** factores seleccionados, se va a realizar un análisis factorial de máxima verosimilitud, utilizando rotación varimax para simplificar la interpretación de los factores. La rotación varimax redistribuye la varianza entre los factores, maximizando las cargas en unas pocas variables y minimizándolas en otras.
+
+```{r}
+fa_model <- fa(current, nfactors = 4, rotate = "varimax", fm = "ml")
+current <- as.data.frame(fa_model$scores)
+```
+
+### Interpretación del modelo
+
+Mostramos las cargas factoriales de las variables en cada uno de los cuatro factores obtenidos. Se va a utilizar un umbral de **0.3** para identificar las variables que contribuyen de manera significativa a cada factor:
+
+```{r}
+loadings <- as.matrix(fa_model$loadings[])
+loadings[abs(loadings) < 0.3] <- NA
+print(loadings, na.print = "", digits = 3)
+```
+
+Los valores de las cargas factoriales indican la relación entre cada variable y el factor correspondiente. Por ejemplo:
+
+- **REL1** tiene una carga muy alta en **ML1** (**0.988**), lo que sugiere que este factor está fuertemente relacionado con aspectos religiosos.
+- **GEN1** presenta una carga alta en **ML3** (**0.838**), lo que que indica que dicho factor tiene una fuerte influencia dle género.
+
+El signo también nos indica si la relación es directa (**+**) o indirecta (**-**). A partir de las cargas factoriales, se caracterizan los factores obtenidos como sigue:
+
+- **ML2 (Características sociodemográficas)**: incluye variables como **TERDEP** (departamento), **ZMV** (zona de medios de vida), **IDIOMA1** (idioma materno) y **ETNIA1** (etnia).
+- **ML4 (Capital humano)**: este factor está relacionado con variables como **EDAD** (edad) y **CH1** (nivel educativo básico).
+- **ML1 (Religión)**: este factor está dominado por la variable **REL1** (religión) y, en menor medida, por **REL2** (importancia de la religión).
+- **ML3 (Género y ocupación)**: agrupa variables relacionadas con **GEN1** (género) y **OCUP1** (ocupación principal).
+
+```{r}
+current <- rename_columns(current, c("Caracteristicas_Sociodemograficas", "Capital_Humano","Religion", "Genero_Ocupacion"))
+```
+
+## Regresión logística binaria
+
+El análisis de regresión logística binaria se utiliza para modelar la intención migratoria (**IM**) a partir de los factores obtenidos en el análisis factorial previo. Este enfoque permite identificar la influencia de cada factor en la decisión de migrar o no migrar. A continuación, se describen los pasos y resultados esperados de este análisis.
+
+### Preparación de los datos
+
+Primero, se eliminan las filas correspondientes a individuos con intención migratoria indecisa. Este paso simplifica el análisis al enfocarlo exclusivamente en decisiones binarias (migrar o no migrar), permitiendo una interpretación más clara de los resultados.
+
+```{r}
+current <- remove_rows(current, rdoubts)
+```
+
+### Creación del modelo
+
+Creamos el modelo de regresión logística:
+
+```{r}
+logit_model <- glm(IM ~ ., data = current, family = binomial)
+logit_predictions <- predict(logit_model, type = "response")
+logit_classification <- ifelse(logit_predictions > 0.5, 1, 0)
+```
+
+### Interpretación del modelo
+
+```{r}
+summary(logit_model)
+```
+
+El modelo, ajustado mediante el método de "Fisher Scoring", alcanza la convergencia en 5 iteraciones. Los coeficientes estimados para los factores, junto con sus valores p y niveles de significancia, se interpretan como sigue:
+
+- **Intercepto (-1.9523)**: representa la log-odds de la intención migratoria cuando todas las variables independientes tienen un valor de cero. Este coeficiente es estadísticamente significativo (p < **2e-16**), indicando que la constante del modelo tiene un impacto relevante.
+- **Características sociodemográficas (-0.0141)**: este factor no resulta estadísticamente significativo (p = **0.907347**), por lo que su efecto en la intención migratoria se considera irrelevante.
+- **Capital humano (-0.5165)**: este coeficiente es estadísticamente significativo (p = **0.000251**), y su valor negativo indica que tiene una relación inversa con la intención migratoria. Es decir, a mayor capital humano, menor probabilidad de migrar.
+- **Religión (0.1213)**: aunque tiene un coeficiente positivo, su p-valor (**0.246310**) sugiere que no es estadísticamente significativo.
+- **Género y ocupación (-0.3410)**: este factor resulta significativo (p = **0.010534**) y tiene una relación negativa con la intención migratoria, indicando que su incremento reduce la probabilidad de migrar.
+
+```{r}
+final <- data.frame(current$Capital_Humano)
+final <- rename_columns(final, c("Capital_Humano"))
+final$Genero_Ocupacion <- current$Genero_Ocupacion
+final$Religion <- current$Religion
+```
+
+### Validación del modelo
+
+#### Prueba omnibus
+
+Evalúa si el modelo completo (con predictores) mejora significativamente en comparación con un modelo nulo (sin predictores). Un p-valor bajo indica que el modelo tiene un buen ajuste global.
+
+```{r}
+null_model <- glm(IM ~ 1, data = current, family = binomial)
+anova(null_model, logit_model, test = "Chisq")
+```
+
+Los resultados muestran que la diferencia en la deviance es estadísticamente significativa (p = **0.0003495**). Esto indica que al menos una de las variables predictoras contribuye significativamente a explicar la intención migratoria, y que el modelo completo mejora significativamente el ajuste respecto al modelo nulo.
+
+#### Pseudo-R² (R-cuadrado de McFadden)
+
+Una medida de la bondad de ajuste del modelo que compara la verosimilitud del modelo con predictores frente al modelo nulo. Valores más altos indican mejor ajuste, aunque no se interpretan como en la regresión lineal.
+
+```{r}
+pR2(logit_model)
+```
+
+El valor de McFadden R², estimado en **0.0379**, es bajo. Esto sugiere que el modelo explica una pequeña proporción de la variabilidad en la intención migratoria. Aunque este valor es común en modelos de regresión logística, indica que el modelo tiene limitaciones en términos de poder explicativo.
+
+#### Prueba de Hosmer-Lemeshow
+
+Evalúa la capacidad del modelo para predecir correctamente las probabilidades observadas agrupadas en deciles. Un p-valor alto sugiere que el modelo se ajusta bien a los datos.
+
+```{r}
+hoslem.test(IM, fitted(logit_model))
+```
+
+La prueba de Hosmer-Lemeshow verifica el ajuste del modelo a los datos. Con un p-valor de **0.6578**, el modelo no rechaza la hipótesis nula de buen ajuste, lo que indica que se ajusta adecuadamente a los datos observados.
+
+#### Curca ROC y AUC (Área Bajo la Curva)
+
+La curva ROC muestra la relación entre la tasa de verdaderos positivos y la tasa de falsos positivos. El AUC mide la capacidad del modelo para distinguir entre las dos clases; un AUC cercano a **1** indica excelente discriminación.
+
+```{r}
+roc_result <- roc(IM, fitted(logit_model))
+plot(roc_result)
+auc(roc_result)
+```
+
+El análisis de la curva ROC y el cálculo del área bajo la curva (AUC) permiten evaluar la capacidad del modelo para clasificar correctamente las observaciones. Un valor de AUC = **0.6536** refleja un rendimiento moderado, indicando que el modelo tiene cierta capacidad discriminativa, aunque no es excelente.
+
+#### Precisión
+
+La precisión es el coeficiente que representa las predicciones acertadad entre el total de muestras.
+
+```{r}
+accuracy(logit_classification, IM)
+```
+
+El modelo muestra una precisión bastante alta (**86.68%**), con lo que se podría decir que estos factores si son capaz de aproximar adecuadamente la intención migratoria.
+
+#### Matriz de confusión
+
+La matriz de confusión muestra los casos positivos y negativos tanto acertados (verdaderos) como fallidos (falsos) al predecirlos.
+
+```{r}
+table(Predicted = logit_classification, Actual = IM)
+```
+
+La matriz de confusión proporciona detalles sobre las predicciones del modelo:
+
+- **Verdaderos positivos (0)**: observaciones correctamente clasificadas como migrantes.
+- **Falso positivos (1)**: casos en los que el modelo clasifica incorrectamente a migrantes como migrantes.
+- **Verdaderos negativos (605)**: observaciones correctamente clasificadas como no migrantes.
+- **Falsos negativos (93)**: casos en los que el modelo clasifica incorrectamente a migrantes como no migrantes.
+
+La matriz confirma que el modelo clasifica de manera precisa una mayoría sustancial de las observaciones. Aunque también muestra como prácticamente todas las clasificaciones que hacen son no migrante.
+
+## Análisis discriminante
+
+### Creación del modelo
+
+Creamos el modelo de análisis discriminante:
+
+```{r}
+lda_model <- lda(IM ~ ., data = current)
+lda_predictions <- predict(lda_model)
+lda_classification <- ifelse(lda_predictions$class == 1, 1, 0)
+```
+
+### Interpretación del modelo
+
+A continuación, se muestra la importancia de cada factor en la determinanción de la clase por parte del análisis discriminante:
+
+```{r}
+lda_model$scaling
+```
+
+El modelo discrimina entre las clases analizando cómo los factores contribuyen a la separación de las observaciones. La matriz de *scaling* refleja los coeficientes de las variables en la función discriminante lineal (LD1). Estos valores indican la influencia relativa de cada factor:
+
+- **Características sociodemográficas (-0.00196)**: tiene una influencia mínima en la discriminación entre las clases.
+- **Capital humano (-1.009)**: este factor tiene un impacto negativo y significativo, lo que sugiere que las características sociodemográficas están asociadas con una menor probabilidad de migrar.
+- **Religión (0.244)**: este factor tiene un efecto positivo en la intención migratoria, aunque su impacto es moderado.
+- **Género y ocupación (-0.661)**: tiene un efecto negativo significativo, lo que implica que mayores niveles de capital humano están asociados con una menor probabilidad de migrar.
+
+```{r}
+plot_LDA(lda_predictions$x, lda_classification)
+```
+
+En el gráfico se observa como todas las predicciónes son no migrante.
+
+### Validación del modelo
+
+#### Lambda de Wilks
+
+Es una medida estadística utilizada en análisis multivariado (como MANOVA o discriminante), que evalúa la proporción de varianza total que no es explicada por las diferencias entre grupos. Valores cercanos a 0 indican que el modelo discrimina bien entre grupos, mientras que valores cercanos a 1 indican poca discriminación.
+
+```{r}
+Wilks.test(IM ~ ., data = current, method = "c")
+```
+
+En este caso, el valor de Lambda de Wilks es **0.9706**, con un p-valor de **0.0003613**, lo que indica que las variables predictoras no contribuyen de manera significativa a la discriminación entre las clases. Esto confirma que el modelo no es capaz de separar las observaciones en las categorías de migrantes y no migrantes.
+
+#### Curca ROC y AUC (Área Bajo la Curva)
+
+```{r}
+roc_result <- roc(IM, lda_predictions$posterior[,2])
+plot(roc_result)
+auc(roc_result)
+```
+
+El AUC de **0.654** indica un rendimiento moderado del modelo, mejor que el azar (AUC = **0.5**) pero lejos de un desempeño óptimo. Esto sugiere que el modelo clasifica correctamente una proporción aceptable de observaciones, aunque tiene margen de mejora. Este resultado es común en estudios sociológicos con factores complejos y múltiples influencias.
+
+#### Precisión
+
+```{r}
+accuracy(lda_classification, IM)
+```
+
+El modelo logra una precisión global del **86.68%**, lo que significa que clasifica correctamente el **86.68%** de las observaciones. Este resultado sugiere que el modelo tiene un buen desempeño en términos de clasificación.
+
+#### Matriz de confusión
+
+```{r}
+table(Predicted = lda_classification, Actual = IM)
+```
+
+Se puede observar en la matriz de confusión, que realmente lo que nuestro modelo hace, es otorgar la intención de no migrar a todos los casos excepto a **1** que de hecho es un falso positivo. Esto probablemente se debe a que más del **80%** de los encuestados no tenían intención de migrar.
+
+## Red neuronal
+
+### Creación del modelo
+
+Para realizar la predicción de la variable dependiente (**IM**), se dividirán los datos en un **80%** para entrenamiento y un **20%** para pruebas. Se establecerá una red neuronal con **100** neuronas en una capa oculta, utilizando un esquema de salida lineal. Posteriormente, las predicciones continuas generadas se transformarán en clasificaciones binarias con un umbral de **0.5**, permitiendo identificar correctamente las clases objetivo. Este enfoque asegurará que el modelo aprenda patrones representativos de los datos de entrenamiento.
+
+```{r}
+trainIndex <- createDataPartition(IM, p = 0.8, list = FALSE)
+
+trainData <- current[trainIndex, ]
+testData <- current[-trainIndex, ]
+
+trainLabels <- IM[trainIndex]
+testLabels <- IM[-trainIndex]
+
+nn_model <- nnet(trainLabels ~ ., data = trainData, linout = TRUE, size = 100, trace = FALSE)
+nn_predictions <- predict(nn_model, testData)
+nn_classification <- ifelse(nn_predictions > 0.5, 1, 0)
+```
+
+### Interpretación del modelo
+
+```{r}
+plot_importance(nn_model, testData, testLabels)
+```
+
+El gráfico de importancia de variables refleja el peso relativo de cada predictor en la capacidad del modelo para discriminar entre las clases de migración y no migración. Los hallazgos principales son los siguientes:
+
+- **Características sociodemográficas** y **capital humano** tienen un impacto positivo importante en la clase de migración, como lo indican las barras azules prominentes. Esto sugiere que un incremento en estas características está vinculado a una mayor probabilidad de migrar.
+- **Religión** también contribuye positivamente a la intención de migrar, aunque su influencia es moderada en comparación con las variables anteriores.
+- **Género y ocupación** presenta un impacto negativo, evidenciado por la barra roja, lo que indica que esta variable está más asociada con la clase de no migración.
+
+Este análisis reafirma el papel clave de factores sociodemográficos y educativos en las decisiones migratorias, mientras que ciertas barreras ocupacionales y de género pueden desalentar la migración.
+
+### Validación del modelo
+
+#### Error cuadrático medio (RMSE)
+
+Es una medida de error que calcula la raíz cuadrada del promedio de los cuadrados de las diferencias entre los valores predichos y los valores observados. Un RMSE más bajo indica que el modelo tiene un mejor ajuste y predice con mayor precisión.
+
+```{r}
+rmse <- sqrt(mean((nn_classification - testLabels)^2))
+rmse
+```
+
+El modelo mostró un error cuadrático medio (RMSE) de **0.36**, lo que sugiere que las diferencias promedio entre las predicciones y los valores reales no son elevadas. Este nivel de error es aceptable, aunque aún deja espacio para mejoras en la predicción.  
+
+#### Precisión
+
+```{r}
+accuracy(nn_classification, testLabels)
+```
+
+a precisión alcanzada fue del **87%**, indicando que el modelo clasifica correctamente la mayoría de los casos en el conjunto de prueba. Esto refleja un rendimiento robusto, pero es importante analizar si el desempeño es consistente en otros conjuntos de datos.  
+
+#### Matriz de confusión
+
+```{r}
+table(Predicted = nn_classification, Actual = testLabels)
+```
+
+La matriz de confusión evidencia un buen equilibrio, con solo **4** falsos positivos (casos predichos como positivos que no lo eran) y **14** falsos negativos (casos no detectados correctamente como positivos). Esto sugiere que el modelo tiene un buen balance entre sensibilidad y especificidad.
+
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Socioeconómicos
+
+En este bloque se va a realizar el estudio con las variables socioeconómicas. Estas son:
+
+- **CFin1**: percepción de la situación económica actual de la familia.
+- **CFinCOVID**: impacto económico de la pandemia en la familia.
+- **DESAS1**: problemas por desastres naturales en los últimos 12 meses.
+- **SPS**: índice de pobreza Simple Poverty Scorecard.
+- **FIES**: escala de experiencia de inseguridad alimentaria.
+- **INST1**: conocimiento de CRS u otras entidades asociadas como ADIPO o Caritas.
+- **INST2**: participación en proyectos de CRS u otras instituciones en los últimos 12 meses.
+- **INST4**: participación en otros proyectos de desarrollo comunitario en el último año (educación, salud, producción agrícola, medio ambiente).
+- **RAIZ1**: tiempo de residencia en la comunidad actual. 
+- **VIOL1**: opinión sobre la seguridad en la comunidad.
+- **MEN1**: número de personas menores de 16 años que viven en el hogar.
+
+Al igual que con el anterior se realizará un análisis de datos, análisis factorial, regresión logística, análisis discriminante y una red neuronal.
+
+```{r}
+current <- socioeconomicos
+```
+
+## Análisis de datos
+
+### Gráficas
+
+A continuación se muestran algunas gráficas que representan como se modela la población en las distintas variables y en función de la intención migratoria.
+
+```{r}
+aux <- remove_rows(current, rdoubts)
+```
+
+```{r}
+aux <- classify_into_intervals(aux, "MEN1", 5)
+
+create_bar_chart(aux$MEN1, IM, NULL, 
+  "Diagrama de barras del número de personas menores en el hogar (sin agrupar) y la intención de migrar",
+  "Número de personas menores en el hogar",
+  "Número de individuos",
+  "Intención de migrar",
+  percentages = FALSE)
+
+create_bar_chart(aux$MEN1_classes, IM, 
+  c(
+    "2 o menos",
+    "Entre 3 y 4",
+    "Entre 5 y 6",
+    "Entre 7 y 8",
+    "Más de 8"
+  ), 
+  "Diagrama de barras del número de personas menores en el hogar y la intención de migrar",
+  "Número de personas menores en el hogar",
+  "Número de individuos",
+  "Intención de migrar")
+
+create_bar_chart(aux$RAIZ1, IM, NULL, 
+  "Diagrama de barras del tiempo que se ha habitado en la comunidad y la intención de migrar",
+  "Número de años que se ha habitado en la comunidad",
+  "Número de individuos",
+  "Intención de migrar")
+
+create_bar_chart(aux$VIOL1, IM, 
+  c(
+  "Muy tranquila",
+  "Moderadamente segura",
+  "Ni pacífica ni insegura",
+  "Moderadamente insegura",
+  "Muy insegura"
+  ), 
+  "Diagrama de barras de la inseguridad en la comunidad y la intención de migrar",
+  "Inseguridad en la comunidad",
+  "Número de individuos",
+  "Intención de migrar")
+
+create_bar_chart(aux$DESAS1, IM,
+  c(
+  "Nada perjudicada",
+  "Un poco perjudicada",
+  "Medianamente perjudicada",
+  "Bastante perjudicada",
+  "Muy perjudicada"
+  ), 
+  "Diagrama de barras de la repercusión de los desastres de los desastres ocurridos en la comunidad y la intención de migrar",
+  "Repercusión de los desastres ocurridos en la comunidad en los últimos 12 meses",
+  "Número de individuos",
+  "Intención de migrar")
+```
+
+### Matriz de correlación
+
+A continuación se muestra un mapa de calor que representa la matriz de correlación de las variables que vamos a estudiar:
+
+```{r}
+plot_correlation_heatmap(current)
+```
+
+### Tests para la validación de datos
+
+#### Test de Kaiser-Meyer-Olkin (KMO)
+
+```{r}
+kmo_result <- KMO(current)
+
+print(kmo_result)
+```
+
+Para mejorar el MSA global (**0.59**), se podrían eliminar las variables **INST1** y **INST2** que son las que menor valor presenta. Estas representan el conocimiento y uso de algunas organizaciones de apoyo económico y probablemente sean importantes en el modelado de la intención migratoria, por lo que no se van a eliminar.
+
+#### Test de esfericidad de Bartlett
+
+```{r}
+cor_matrix <- cor(current)
+n <- nrow(current)
+
+bartlett_result <- cortest.bartlett(cor_matrix, n)
+
+print(bartlett_result)
+```
+
+El resultado obtenido es altamente significativo (χ² = **956.5191**, p < **0.001**), lo que confirma que las correlaciones entre las variables son estadísticamente significativas y adecuadas para este análisis.
+
+### Comunalidades
+
+Primero vamos a proceder a la elección del número de factores con análisis factorial paralelo.
+
+```{r}
+eigenvalues <- fa.parallel(current, fa = "fa")
+```
+
+Calculamos las comunalidades con **4** factores.
+
+```{r}
+fa_temp <- fa(current, nfactors = 4, rotate = "varimax", fm = "ml")
+print(fa_temp$communality)
+
+low_communalities <- names(which(fa_temp$communality < 0.4))
+print(low_communalities)
+```
+
+En el análisis realizado, se pueden identificar varias variables con comunalidades bajas, lo que sugiere que estas no están bien representadas en el modelo factorial. Las variables con las menores comunalidades fueron:  
+
+- **RAIZ1 (0.008)**: tiempo de residencia en la comunidad actual. 
+- **DESAS1 (0.167)**: percepción de desastres.  
+- **FIES (0.193)**: inseguridad alimentaria.  
+- **INST4 (0.052)**: confianza en instituciones específicas.  
+- **VIOL1 (0.101)**: percepción de violencia.  
+- **MEN1 (0.230)**: percepción de amenazas.  
+
+De estas, se ha decidido eliminar las variables **RAIZ1** y **INST4** y **VIOL1** del análisis debido a sus comunalidades extremadamente bajas, lo que indica que no contribuyen de manera significativa al modelo. Por otro lado, se conservan las variables **DESAS1**, **FIES** y **MEN1**, ya que representan aspectos importantes del fenómeno estudiado y no cuentan con variables alternativas que cubran su contenido.
+
+```{r}
+current <- remove_columns(current, c("INST4", "VIOL1", "RAIZ1"))
+```
+
+## Análisis factorial
+
+### Elección del número de factores
+
+Para determinar el número adecuado de factores, se realizó un análisis de componentes principales (PCA).
+
+```{r}
+pca_result <- prcomp(current, center = TRUE, scale. = TRUE)
+summary(pca_result)
+``` 
+
+Se ha optado por utilizar **4** factores debido a que con este número se explica un **72.07%** de la varianza.
+
+### Creación del modelo
+
+Con los **4** factores seleccionados, se realizó un análisis factorial de máxima verosimilitud, utilizando rotación varimax para simplificar la interpretación de los factores.
+
+```{r}
+fa_model <- fa(current, nfactors = 4, rotate = "varimax", fm = "ml")
+current <- as.data.frame(fa_model$scores)
+```
+
+### Interpretación
+
+Mostramos las cargas factoriales de las variables en cada uno de los cuatro factores obtenidos. Se va a utilizar un umbral de **0.3** para identificar las variables que contribuyen de manera significativa a cada factor:
+
+```{r}
+loadings <- as.matrix(fa_model$loadings[])
+loadings[abs(loadings) < 0.3] <- NA
+print(loadings, na.print = "", digits = 3)
+```
+
+A partir de las cargas factoriales, se caracterizan los factores obtenidos como sigue:  
+
+- **ML1 (Economía)**: este factor está dominado por las variables **CFin1** (percepción de la situación económica actual de la familia) y **CFinCOVID** (impacto económico de la pandemia en la familia), lo que refleja la percepción general sobre la estabilidad financiera del hogar.  
+- **ML2 (Instituciones)**: incluye las variables **INST1** (conocimiento de CRS u otras entidades asociadas) y **INST2** (participación en proyectos de CRS u otras instituciones en los últimos 12 meses), lo que sugiere una dimensión relacionada con la participación comunitaria e institucional.  
+- **ML3 (Pobreza y hogar)**: agrupa variables como **SPS** (índice de pobreza Simple Poverty Scorecard) y **MEN1** (número de personas menores de 16 años que viven en el hogar), lo que apunta a un enfoque en las características socioeconómicas y demográficas del hogar.  
+- **ML4 (Vulnerabilidad y seguridad alimentaria)**: este factor está relacionado con variables como **DESAS1** (problemas por desastres naturales en los últimos 12 meses) y **FIES** (escala de experiencia de inseguridad alimentaria), lo que representa la exposición a vulnerabilidades externas y dificultades básicas.  
+```{r}
+current <- rename_columns(current, c("Economia", "Instituciones", "Pobreza_Hogar", "Vulnerabilidad_Seguridad_Alimentaria"))
+```
+
+## Regresión logística binaria
+
+### Preparación de los datos
+
+Primero, se eliminan las filas correspondientes a individuos con intención migratoria indecisa.
+
+```{r}
+current <- remove_rows(current, rdoubts)
+```
+
+### Creación del modelo
+
+Creamos el modelo de regresión logística:
+
+```{r}
+logit_model <- glm(IM ~ ., data = current, family = binomial)
+logit_predictions <- predict(logit_model, type = "response")
+logit_classification <- ifelse(logit_predictions > 0.5, 1, 0)
+```
+
+### Interpretación del modelo
+
+```{r}
+summary(logit_model)
+```
+
+El modelo de regresión logística ajustado mediante el método de "Fisher Scoring" alcanza la convergencia en 4 iteraciones. Los coeficientes estimados, junto con sus valores p y niveles de significancia, se interpretan como sigue:  
+
+- **Intercepto (-1.8799)**: representa las log-odds de la intención migratoria cuando todas las variables independientes tienen un valor de cero. Este coeficiente es estadísticamente significativo (p < **2e-16**), lo que indica que la constante tiene un impacto relevante en el modelo.  
+- **Economía (-0.0325)**: este coeficiente no es estadísticamente significativo (p = **0.771**), lo que sugiere que la percepción económica no tiene un efecto relevante sobre la intención migratoria.  
+- **Instituciones (-0.0351)**: el coeficiente asociado a este factor tampoco es significativo (p = **0.757**), indicando que la interacción con instituciones no influye en la intención migratoria de manera relevante.  
+- **Pobreza en el hogar (-0.0567)**: este factor no muestra significancia estadística (p = **0.685**), lo que implica que la condición de pobreza en el hogar no está relacionada con la probabilidad de migrar en este modelo.  
+- **Vulnerabilidad y seguridad alimentaria (0.1684)**: aunque tiene un coeficiente positivo, el p-valor (**0.374**) sugiere que este factor no es estadísticamente significativo, por lo que no tiene un impacto relevante en la intención migratoria.  
+
+El modelo sugiere que ninguna de las variables independientes analizadas tiene un efecto significativo en la intención migratoria, salvo el intercepto. Esto podría indicar que otros factores no considerados en el modelo están influyendo en la decisión de migrar.
+
+### Validación del modelo
+
+#### Prueba omnibus
+
+```{r}
+null_model <- glm(IM ~ 1, data = current, family = binomial)
+anova(null_model, logit_model, test = "Chisq")
+```
+
+Los resultados muestran que la diferencia en la deviance no es estadísticamente significativa (p = **0.9048**). Esto indica que las variables predictoras no contribuyen significativamente a explicar la intención migratoria, y el modelo completo no mejora sustancialmente el ajuste respecto al modelo nulo. 
+
+#### Pseudo-R² (R-cuadrado de McFadden)
+
+```{r}
+pR2(logit_model)
+```
+
+El valor de McFadden R², estimado en **0.00188**, es extremadamente bajo. Esto sugiere que el modelo explica una proporción ínfima de la variabilidad en la intención migratoria. Aunque valores bajos de R² son comunes en modelos de regresión logística, este resultado indica una muy limitada capacidad explicativa del modelo.
+
+#### Prueba de Hosmer-Lemeshow
+
+```{r}
+hoslem.test(IM, fitted(logit_model))
+```
+
+La prueba de Hosmer-Lemeshow verifica el ajuste del modelo a los datos observados. Con un p-valor de **0.4126**, no se rechaza la hipótesis nula de buen ajuste. Esto implica que el modelo se ajusta adecuadamente a los datos, a pesar de sus limitaciones explicativas.  
+
+#### Curca ROC y AUC (Área Bajo la Curva)
+
+```{r}
+roc_result <- roc(IM, fitted(logit_model))
+plot(roc_result)
+auc(roc_result)
+```
+
+El cálculo del AUC (Área Bajo la Curva) dan un valor de **0.5309**. Esto indica que el modelo tiene una capacidad de clasificación casi aleatoria, reflejando un desempeño discriminativo deficiente.  
+
+#### Precisión
+
+```{r}
+accuracy(logit_classification, IM)
+```
+
+El modelo muestra una precisión de **86.68%**, que parece alta. Sin embargo, este resultado es engañoso, ya que se debe principalmente a que la mayoría de los encuestados no tenían intención de migrar.  
+#### Matriz de confusión
+
+```{r}
+table(Predicted = logit_classification, Actual = IM)
+```
+
+La matriz de confusión muestra que el modelo clasifica prácticamente todos los casos como "no intención de migrar", excepto un falso positivo. Esto sugiere que el modelo tiene un sesgo hacia la categoría predominante (no migrar) y una capacidad limitada para identificar casos con intención de migrar.  
+
+## Análisis discriminante
+
+### Creación del modelo
+
+Creamos el modelo de análisis discriminante:
+
+```{r}
+lda_model <- lda(IM ~ ., data = current)
+lda_predictions <- predict(lda_model)
+lda_classification <- ifelse(lda_predictions$class == 1, 1, 0)
+```
+
+### Interpretación del modelo
+
+A continuación, se muestra la importancia de cada factor en la determinanción de la clase por parte del análisis discriminante:
+
+```{r}
+lda_model$scaling
+```
+
+El modelo discrimina entre las clases analizando cómo los factores contribuyen a la separación de las observaciones. La matriz de *scaling* refleja los coeficientes de las variables en la función discriminante lineal (**LD1**). Estos valores indican la influencia relativa de cada factor:  
+
+- **Economía (-0.280)**: tiene una influencia negativa moderada en la discriminación entre las clases, lo que sugiere que una peor percepción de la situación económica está asociada con una mayor probabilidad de migrar.  
+- **Instituciones (-0.307)**: este factor también tiene un impacto negativo, aunque menos pronunciado, indicando que la interacción con instituciones no favorece la intención migratoria.  
+- **Pobreza en el hogar (-0.502)**: muestra un impacto negativo más fuerte, lo que implica que condiciones de mayor pobreza están vinculadas con una menor probabilidad de migrar, posiblemente por limitaciones económicas que restringen la movilidad.  
+- **Vulnerabilidad y seguridad alimentaria (1.489)**: este factor tiene el mayor efecto positivo en la discriminación entre las clases. Una mayor vulnerabilidad alimentaria está asociada con una mayor probabilidad de migrar, posiblemente como estrategia para buscar mejores condiciones de vida.  
+
+```{r}
+plot_LDA(lda_predictions$x, lda_classification)
+```
+
+En el gráfico se observa como todas las predicciónes son no migrante.
+
+### Validación del modelo
+
+#### Lambda de Wilks
+
+```{r}
+Wilks.test(IM ~ ., data = current, method = "c")
+```
+
+En este caso, el valor de Lambda de Wilks es **0.99852**, con un p-valor de **0.9058**, lo que indica que no hay diferencias significativas en las medias de las variables predictoras entre las clases. Esto sugiere que las variables consideradas tienen una contribución limitada a la discriminación entre las categorías de migrantes y no migrantes.  
+
+#### Curca ROC y AUC (Área Bajo la Curva)
+
+```{r}
+roc_result <- roc(IM, lda_predictions$posterior[,2])
+plot(roc_result)
+auc(roc_result)
+```
+
+El análisis de la curva ROC arroja un AUC de **0.5309**, lo que indica que el rendimiento del modelo es apenas mejor que el azar (AUC = **0.5**). Esto refleja una capacidad discriminativa limitada y subraya la necesidad de ajustar o incluir otras variables para mejorar la capacidad predictiva del modelo.  
+
+#### Precisión
+
+```{r}
+accuracy(lda_classification, IM)
+```
+
+El modelo alcanza una precisión global de **86.68%**, lo que significa que clasifica correctamente la gran mayoría de las observaciones. Sin embargo, este alto porcentaje puede deberse a un sesgo en la distribución de las clases (mayor proporción de no migrantes).  
+
+#### Matriz de confusión
+
+```{r}
+table(Predicted = lda_classification, Actual = IM)
+```
+
+Como se aprecia en la matriz de confusión, nuestro modelo asigna la intención de no migrar en todos los casos, excepto en uno, que resulta ser un falso positivo. Esto probablemente se explica por el hecho de que más del **80%** de los encuestados no expresaron intención de migrar.
+
+## Red neuronal
+
+### Creación del modelo
+
+Para realizar la predicción de la variable dependiente (**IM**), se dividirán los datos en un **80%** para entrenamiento y un **20%** para pruebas. Se establecerá una red neuronal con **100** neuronas en una capa oculta, utilizando un esquema de salida lineal. Posteriormente, las predicciones continuas generadas se transformarán en clasificaciones binarias con un umbral de **0.5**, permitiendo identificar correctamente las clases objetivo. Este enfoque asegurará que el modelo aprenda patrones representativos de los datos de entrenamiento.
+
+```{r}
+trainIndex <- createDataPartition(IM, p = 0.8, list = FALSE)
+
+trainData <- current[trainIndex, ]
+testData <- current[-trainIndex, ]
+
+trainLabels <- IM[trainIndex]
+testLabels <- IM[-trainIndex]
+
+nn_model <- nnet(trainLabels ~ ., data = trainData, linout = TRUE, size = 100, trace = FALSE)
+nn_predictions <- predict(nn_model, testData)
+nn_classification <- ifelse(nn_predictions > 0.5, 1, 0)
+```
+
+### Interpretación del modelo
+
+```{r}
+plot_importance(nn_model, testData, testLabels)
+```
+
+El gráfico de importancia de variables muestra el peso relativo de cada predictor en la capacidad del modelo para discriminar entre las clases de migración. Los resultados indican lo siguiente:
+
+- **Pobreza y hogar** e **instituciones** tienen una contribución positiva y significativa hacia la clase de migración, reflejada en barras azules largas. Esto sugiere que un aumento en estos factores está asociado con una mayor intención migratoria.
+- **Vulnerabilidad y seguridad alimentaria** tiene un impacto negativo considerable, representado por una barra roja, indicando que una mayor vulnerabilidad está asociada con la clase de no migración.
+- **Economía** tiene una contribución positiva leve, aunque su influencia relativa es menor comparada con otras variables.
+
+Este análisis sugiere que las variables relacionadas con condiciones socioeconómicas y percepciones institucionales son factores determinantes en la intención de migrar.
+
+### Validación del modelo
+
+#### Error cuadrático medio (RMSE)
+
+```{r}
+rmse <- sqrt(mean((nn_classification - testLabels)^2))
+rmse
+```
+
+El modelo mostró un error cuadrático medio (RMSE) de **0.38**, lo que sugiere que las diferencias promedio entre las predicciones y los valores reales no son elevadas. Este nivel de error es aceptable, aunque aún deja espacio para mejoras en la predicción.  
+
+#### Precisión
+
+```{r}
+accuracy(nn_classification, testLabels)
+```
+
+La precisión alcanzada fue del **86%**, indicando que el modelo clasifica correctamente la mayoría de los casos en el conjunto de prueba. Esto refleja un rendimiento robusto, pero es importante analizar si el desempeño es consistente en otros conjuntos de datos.  
+
+#### Matriz de confusión
+
+```{r}
+table(Predicted = nn_classification, Actual = testLabels)
+```
+
+La matriz de confusión evidencia un buen equilibrio, con solo **2** falsos positivos (casos predichos como positivos que no lo eran) y **18** falsos negativos (casos no detectados correctamente como positivos).
+
+---
+
+
+
+
+
+
+
+
+
+# Personalidad
+
+En este bloque se llevará a cabo el estudio con las siguientes variables relacionadas con las características de la personalidad. Las variables a analizar son:
+
+- **CH3SAS**: valoración de la vida.  
+- **AUT1**: seguridad en la capacidad de cumplir metas personales.  
+- **AUT2**: persistencia ante dificultades laborales.  
+- **AUT3**: falta de reacción ante problemas inesperados.  
+- **AUT4**: indisposición para enfrentar tareas complicadas.  
+- **OPT1**: expectativa de resultados positivos en la vida.  
+- **OPT2**: optimismo sobre el futuro.  
+- **OPT3**: resistencia al desánimo.  
+- **OPT4**: tendencia a ver el lado negativo de las cosas.  
+- **OPT5**: nivel de imaginación personal.  
+- **OPT6**: apertura a nuevas experiencias.  
+- **OPT7**: generación constante de ideas.  
+- **OPT8**: preferencia por una vida sin complicaciones.  
+- **LC1**: percepción de control externo sobre los eventos de la vida.  
+- **LC2**: atribución de logros personales a la suerte.  
+- **LC3**: relación entre esfuerzo personal y logros.  
+- **LC4**: confianza en que el esfuerzo determina el éxito al migrar.  
+
+Se realizarán análisis de datos, análisis factorial, regresión logística, análisis discriminante y una red neuronal para identificar patrones y generar predicciones basadas en estas variables.
+
+```{r}
+print(cpersonalidad)
+current <- personalidad
+```
+
+## Análisis de datos
+
+### Gráficas
+
+A continuación se muestran algunas gráficas que representan como se modela la población en las distintas variables y en función de la intención migratoria.
+
+```{r}
+aux <- remove_rows(current, rdoubts)
+```
+
+```{r}
+aux <- classify_into_intervals(aux, "CH3SAS", 5)
+
+create_bar_chart(aux$CH3SAS, IM, NULL,
+  "Diagrama de barras de la valoración de vida (sin agrupar) y la intención de migrar",
+  "Valoración de vida", 
+  "Número de individuos", 
+  "Intención de migrar",
+  percentages = FALSE
+)
+
+create_bar_chart(aux$CH3SAS_classes, IM,
+  c(
+    "2 o menos",
+    "Entre 3 y 4",
+    "Entre 5 y 6",
+    "Entre 7 y 8",
+    "Más de 8"
+  ),
+  "Diagrama de barras de la valoración de vida y la intención de migrar",
+  "Valoración de vida", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+
+
+create_bar_chart(aux$AUT1, IM,
+  c(
+    "Ninguna",
+    "Media",
+    "Total"
+  ),
+  "Diagrama de barras de la seguridad para cumplir metas y la intención de migrar",
+  "Seguridad para cumplir metas",
+  "Número de individuos",
+  "Intención de migrar"
+)
+
+create_bar_chart(aux$OPT1, IM,
+  c(
+    "No espero que salgan como quiero",
+    "Indeciso",
+    "Salen como quiero"
+  ), 
+  "Diagrama de barras del optimismo en el resultado de acciones y la intención de migrar", 
+  "Optimismo en el resultado de acciones", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+
+create_bar_chart(aux$LC1, IM, 
+  c(
+    "Ninguna",
+    "Media",
+    "Total"
+  ),
+  "Diagrama de barras de la dependencia de las decisiones de otros y la intención de migrar", 
+  "Dependencia de las decisiones de otros", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+```
+
+### Matriz de correlación
+
+A continuación se muestra un mapa de calor que representa la matriz de correlación de las variables que vamos a estudiar:
+
+```{r}
+plot_correlation_heatmap(current)
+```
+
+### Tests para la validación de datos
+
+#### Test de Kaiser-Meyer-Olkin (KMO)
+
+```{r}
+kmo_result <- KMO(current)
+
+print(kmo_result)
+```
+
+Para mejorar el MSA global (**0.74**), se podrían eliminar las variables **OPT2** (**0.61**) y **LC2** (**0.65**), que son las que presentan los valores más bajos. Estas variables están relacionadas con ciertos aspectos de la toma de decisiones y probablemente tengan importancia en el análisis general. Dado que su relevancia teórica en el modelo es significativa, se decidió mantenerlas en el análisis, a pesar de sus valores de MSA relativamente bajos.
+
+#### Test de esfericidad de Bartlett
+
+```{r}
+cor_matrix <- cor(current)
+n <- nrow(current)
+bartlett_result <- cortest.bartlett(cor_matrix, n)
+
+print(bartlett_result)
+```
+
+En este caso, el resultado fue altamente significativo (χ² = **1399.507**, p < **0.001**), lo que confirma que las correlaciones entre las variables son significativas y adecuadas para este análisis.
+
+#### Comunalidades
+
+Primero vamos a proceder a la elección del número de factores con análisis factorial paralelo.
+
+```{r}
+eigenvalues <- fa.parallel(current, fa = "fa")
+```
+
+Calculamos las comunalidades con **5** factores.
+
+```{r}
+fa_temp <- fa(current, nfactors = 5, rotate = "varimax", fm = "ml")
+print(fa_temp$communality)
+
+low_communalities <- names(which(fa_temp$communality < 0.4))
+print(low_communalities)
+```
+
+En el análisis realizado, se pueden identificar varias variables con comunalidades bajas, lo que sugiere que estas no están bien representadas en el modelo factorial. Las variables con las menores comunalidades fueron:
+
+- **OPT2 (0.089)**: optimismo sobre el futuro.
+- **CH3SAS (0.082)**: valoración de la vida.  
+- **OPT3 (0.133)**: resistencia al desánimo.  
+- **OPT4 (0.142)**: tendencia a ver el lado negativo de las cosas.  
+- **OPT1 (0.213)**: expectativa de resultados positivos en la vida.  
+
+De estas, se ha decidido eliminar las variables **OPT2**, **OPT4** y **CH3SAS** debido a sus comunalidades extremadamente bajas, lo que indica que no contribuyen de manera significativa al modelo. Por otro lado, se conservan las variables **OPT3** y **OPT1**, ya que aunque presentan comunalidades bajas, aún aportan información relevante al análisis y no existen variables alternativas que cubran su contenido de manera adecuada.
+
+```{r}
+current <- remove_columns(current, c("OPT2", "OPT4", "CH3SAS"))
+```
+
+## Análisis factorial
+
+### Elección del número de factores
+
+Para determinar el número adecuado de factores, se realizó un análisis de componentes principales (PCA).
+
+```{r}
+pca_result <- prcomp(current, center = TRUE, scale. = TRUE)
+summary(pca_result)
+``` 
+
+Se ha optado por utilizar **5** factores debido a que con este número se explica un **55.25%** de la varianza.
+
+### Creación del modelo
+
+Con los **5** factores seleccionados, se realizó un análisis factorial de máxima verosimilitud, utilizando rotación varimax para simplificar la interpretación de los factores.
+
+```{r}
+fa_model <- fa(current, nfactors = 5, rotate = "varimax", fm = "ml")
+current <- as.data.frame(fa_model$scores)
+```
+
+### Interpretación del modelo
+
+Mostramos las cargas factoriales de las variables en cada uno de los cuatro factores obtenidos. Se va a utilizar un umbral de **0.3** para identificar las variables que contribuyen de manera significativa a cada factor:
+
+```{r}
+loadings <- as.matrix(fa_model$loadings[])
+loadings[abs(loadings) < 0.3] <- NA
+print(loadings, na.print = "", digits = 3)
+```
+
+A partir de las cargas factoriales, se caracterizan los factores obtenidos como sigue:
+
+- **ML1 (Creatividad y optimismo)**: este factor está dominado por las variables **OPT5** (nivel de imaginación personal), **OPT6** (apertura a nuevas experiencias) y **OPT7** (generación constante de ideas). Refleja una dimensión vinculada a la capacidad creativa y la disposición para explorar nuevas perspectivas.
+- **ML3 (Autoeficacia)**: incluye variables como **AUT3** (falta de reacción ante problemas inesperados), **AUT4** (indisposición para enfrentar tareas complicadas) y **OPT1** (expectativa de resultados positivos en la vida). Este factor está relacionado con la confianza en la propia capacidad para superar dificultades y mantener el enfoque en los objetivos.
+- **ML4 (Control interno)**: este factor agrupa **LC3** (relación entre esfuerzo personal y logros) y **LC4** (confianza en que el esfuerzo determina el éxito al migrar). Refleja una dimensión de control interno, donde el individuo cree que su éxito depende de su dedicación y trabajo.
+- **ML2 (Seguridad)**: incluye **AUT1** (seguridad en la capacidad de cumplir metas personales). Representa la autoconfianza en la planificación y consecución de objetivos individuales.
+- **ML5 (Control externo)**: está dominado por las variables **LC1** (percepción de control externo sobre los eventos de la vida) y **LC2** (atribución de logros personales a la suerte). Este factor se relaciona con una visión externa del control, donde el individuo considera que los eventos están más allá de su control personal.
+```{r}
+current <- rename_columns(current, c("Creatividad_Optimismo", "Autoeficacia", "Control_Interno", "Seguridad", "Control_Externo"))
+```
+
+## Regresión logística binaria
+
+### Preparación de los datos
+
+Primero, se eliminan las filas correspondientes a individuos con intención migratoria indecisa.
+
+```{r}
+current <- remove_rows(current, rdoubts)
+```
+
+### Creación del modelo
+
+Creamos el modelo de regresión logística:
+
+```{r}
+logit_model <- glm(IM ~ ., data = current, family = binomial)
+logit_predictions <- predict(logit_model, type = "response")
+logit_classification <- ifelse(logit_predictions > 0.5, 1, 0)
+```
+
+### Interpretación del modelo
+
+```{r}
+summary(logit_model)
+```
+
+El modelo de regresión logística ajustado mediante el método de "Fisher Scoring" alcanzó la convergencia en 5 iteraciones. Los coeficientes estimados, junto con sus valores p y niveles de significancia, se interpretan de la siguiente manera:
+
+- **Intercepto (-1.9930)**: este coeficiente es altamente significativo (p < **2e-16**), indicando que la constante tiene un impacto relevante en el modelo.
+- **Creatividad y optimismo (0.5034)**: este coeficiente es positivo y estadísticamente significativo (p = **0.00903**), lo que sugiere que una mayor creatividad y optimismo incrementan la probabilidad de intención migratoria. La asociación es relevante en este contexto.
+- **Autoeficacia (0.2880)**: tiene un coeficiente positivo, pero su significancia estadística es marginal (p = **0.06283**). Esto indica que existe una ligera evidencia de que una mayor autoeficacia podría aumentar la probabilidad de intención migratoria, aunque no es concluyente.
+- **Control interno (0.2323)**: este coeficiente no es estadísticamente significativo (**p = 0.31729**), lo que sugiere que la percepción de control interno sobre los eventos de la vida no tiene un impacto relevante en la intención migratoria en este modelo.
+- **Seguridad (0.1606)**: similar al control interno, este coeficiente tampoco es significativo (**p = 0.32984**), indicando que la percepción de seguridad no influye de manera relevante en la probabilidad de migrar.
+- **Control externo (-0.4950)**: este coeficiente es negativo y estadísticamente significativo (**p = 0.00650**). Esto sugiere que una mayor percepción de control externo reduce la probabilidad de intención migratoria.
+
+```{r}
+final$Creatividad_Optimismo <- current$Creatividad_Optimismo
+final$Control_Externo <- current$Control_Externo
+final$Autoeficacia <- current$Autoeficacia
+```
+
+### Validación del modelo  
+
+#### Prueba ómnibus  
+
+```{r}
+null_model <- glm(IM ~ 1, data = current, family = binomial)  
+anova(null_model, logit_model, test = "Chisq")  
+```  
+
+Los resultados muestran que la diferencia en la deviance es estadísticamente significativa (p = **0.0007699**). Esto indica que las variables predictoras contribuyen significativamente al modelo, mejorando su ajuste en comparación con el modelo nulo.  
+
+#### Pseudo-R² (R-cuadrado de McFadden)  
+
+```{r}
+pR2(logit_model)  
+```  
+
+El McFadden R² estimado es **0.0385**, lo que indica que el modelo explica una pequeña proporción de la variabilidad en la intención migratoria. Aunque este valor es bajo, es común en modelos de regresión logística, reflejando una capacidad explicativa limitada.  
+
+#### Prueba de Hosmer-Lemeshow  
+
+```{r}
+hoslem.test(IM, fitted(logit_model))  
+```  
+
+La prueba de Hosmer-Lemeshow arroja un p-valor de **0.1488**, lo que indica que no se rechaza la hipótesis nula de buen ajuste. Esto sugiere que el modelo se ajusta adecuadamente a los datos observados, a pesar de sus limitaciones explicativas.  
+
+#### Curva ROC y AUC (Área Bajo la Curva)  
+
+```{r}
+roc_result <- roc(IM, fitted(logit_model))  
+plot(roc_result)  
+auc(roc_result)  
+```  
+
+El análisis de la curva ROC** y el cálculo del AUC dan un valor de **0.6543**, lo que indica una capacidad de clasificación moderada. Aunque el desempeño discriminativo es mejor que el azar, sigue siendo limitado para predecir con precisión la intención migratoria.  
+
+#### Precisión  
+
+```{r}
+accuracy(logit_classification, IM)  
+```  
+
+El modelo muestra una precisión de **86.68%**. Sin embargo, este valor refleja principalmente la alta proporción de casos sin intención migratoria, lo que puede sesgar la percepción del rendimiento del modelo.  
+
+#### Matriz de confusión  
+
+```{r}
+table(Predicted = logit_classification, Actual = IM)  
+```  
+
+La matriz de confusión muestra que el modelo clasifica correctamente la mayoría de los casos sin intención de migrar (**605**), pero identifica pocos casos con intención de migrar (**93**). Esto sugiere que el modelo tiene un sesgo hacia la categoría predominante (no migrar), con una capacidad limitada para detectar correctamente los casos de intención migratoria.  
+
+
+## Análisis discriminante
+
+### Creación del modelo
+
+Creamos el modelo de análisis discriminante:
+
+```{r}
+lda_model <- lda(IM ~ ., data = current)
+lda_predictions <- predict(lda_model)
+lda_classification <- ifelse(lda_predictions$class == 1, 1, 0)
+```
+
+### Interpretación del modelo
+
+A continuación, se muestra la importancia de cada factor en la determinanción de la clase por parte del análisis discriminante:
+
+```{r}
+lda_model$scaling
+```
+
+El modelo discrimina entre las clases analizando cómo los factores contribuyen a la separación de las observaciones. La matriz de *scaling* refleja los coeficientes de las variables en la función discriminante lineal (**LD1**). Estos valores indican la influencia relativa de cada factor:  
+
+- **Creatividad y optimismo (0.753)**: este factor tiene la mayor influencia positiva en la discriminación entre las clases. Una mayor creatividad y optimismo están asociadas con una mayor probabilidad de pertenecer a la clase que representa la intención de migrar, lo que sugiere que las personas con estas características tienden a ver la migración como una oportunidad positiva.  
+- **Autoeficacia (0.641)**: también tiene un efecto positivo considerable, indicando que las personas con mayor confianza en su capacidad para alcanzar metas personales tienen una mayor probabilidad de tener intención migratoria.  
+- **Control interno (0.172)**: su influencia es positiva pero relativamente baja, lo que sugiere que la creencia en que los eventos de la vida dependen de su propio esfuerzo tiene un impacto menor en la discriminación entre las clases.  
+- **Seguridad (0.226)**: tiene una influencia positiva moderada, indicando que la percepción de seguridad contribuye ligeramente a la probabilidad de intención migratoria.  
+- **Control externo  (-0.953)**: este factor tiene el mayor impacto negativo en la función discriminante. Una mayor percepción de control externo está asociada con una menor probabilidad de tener intención migratoria.
+
+```{r}
+plot_LDA(lda_predictions$x, lda_classification)
+```
+
+En el gráfico se observa como todas las predicciónes son no migrante.
+
+### Validación del modelo  
+
+#### Lambda de Wilks  
+
+```{r}
+Wilks.test(IM ~ ., data = current, method = "c")  
+```  
+
+En este caso, el valor de Lambda de Wilks es **0.97458**, con un p-valor de **0.0031**, lo que indica que no hay diferencias significativas en las medias de las variables predictoras entre las clases. Esto sugiere que las variables consideradas tienen una contribución limitada a la discriminación entre las categorías de migrantes y no migrantes. 
+
+#### Curva ROC y AUC (Área Bajo la Curva)  
+
+```{r}
+roc_result <- roc(IM, lda_predictions$posterior[,2])  
+plot(roc_result)  
+auc(roc_result)  
+```  
+
+El análisis de la curva ROC arroja un AUC de **0.6465**, lo que indica que el modelo tiene una capacidad discriminativa moderada, mejor que el azar (AUC = **0.5**). Aunque no es óptimo, este valor sugiere que el modelo logra diferenciar parcialmente entre las clases.  
+
+#### Precisión  
+
+```{r}
+accuracy(lda_classification, IM)  
+```  
+
+El modelo muestra una precisión global de **86.68%**, lo que indica un buen desempeño en términos de clasificación general. Sin embargo, esta alta precisión podría deberse al sesgo de clase, dado que la mayoría de las observaciones corresponden a no migrantes.  
+
+#### Matriz de confusión  
+
+```{r}
+table(Predicted = lda_classification, Actual = IM)  
+```  
+
+La matriz de confusión muestra que nuestro modelo clasifica casi todos los casos como intención de no migrar, con la excepción de uno, que corresponde a un falso positivo. Esto puede deberse a que más del **80%** de los encuestados manifestaron no tener intención de migrar.
+
+## Red neuronal
+
+### Creación del modelo
+
+Para realizar la predicción de la variable dependiente (**IM**), se dividirán los datos en un **80%** para entrenamiento y un **20%** para pruebas. Se establecerá una red neuronal con **100** neuronas en una capa oculta, utilizando un esquema de salida lineal. Posteriormente, las predicciones continuas generadas se transformarán en clasificaciones binarias con un umbral de **0.5**, permitiendo identificar correctamente las clases objetivo. Este enfoque asegurará que el modelo aprenda patrones representativos de los datos de entrenamiento.
+
+```{r}
+trainIndex <- createDataPartition(IM, p = 0.8, list = FALSE)
+
+trainData <- current[trainIndex, ]
+testData <- current[-trainIndex, ]
+
+trainLabels <- IM[trainIndex]
+testLabels <- IM[-trainIndex]
+
+nn_model <- nnet(trainLabels ~ ., data = trainData, linout = TRUE, size = 100, trace = FALSE)
+nn_predictions <- predict(nn_model, testData)
+nn_classification <- ifelse(nn_predictions > 0.5, 1, 0)
+```
+
+### Interpretación del modelo
+
+```{r}
+plot_importance(nn_model, testData, testLabels)
+```
+
+El gráfico de importancia de variables muestra el peso relativo de cada predictor en la capacidad del modelo para clasificar entre migración y no migración. Los resultados indican lo siguiente:
+
+- **Seguridad** tiene una contribución positiva y significativa hacia la clase de migración, representada por una barra azul larga. Esto sugiere que una mayor percepción deseguridad está asociada con una mayor intención de migrar.
+- **Control interno** también muestra una leve contribución positiva hacia la migración, aunque con un impacto mucho menor en comparación con el control externo.
+- **Autoeficacia**, **creatividad y optimismo**, y **control externo** presentan un impacto negativo considerable, evidenciado por las barras rojas. Esto indica que mayores niveles de estas variables están más asociados con la clase de no migración.
+
+El análisis sugiere que factores psicológicos relacionados con la percepción de control y la seguridad personal juegan un rol importante en las decisiones migratorias.
+
+### Validación del modelo
+
+#### Error cuadrático medio (RMSE)
+
+```{r}
+rmse <- sqrt(mean((nn_classification - testLabels)^2))
+rmse
+```
+
+El modelo mostró un error cuadrático medio (RMSE) de **0.36**, lo que sugiere que las diferencias promedio entre las predicciones y los valores reales son bastante pequeñas. Este nivel de error es aceptable y refleja una buena capacidad del modelo para hacer predicciones precisas, aunque sigue existiendo espacio para una mejora en la exactitud de las predicciones.
+
+#### Precisión
+
+```{r}
+accuracy(nn_classification, testLabels)
+```
+
+La precisión alcanzada fue del **87.05%**, lo que indica que el modelo clasifica correctamente la mayoría de los casos en el conjunto de prueba. Este rendimiento es bastante sólido, pero es importante validar si este desempeño se mantiene en otros conjuntos de datos y en situaciones más diversas.
+
+#### Matriz de confusión
+
+```{r}
+table(Predicted = nn_classification, Actual = testLabels)
+```
+
+La matriz de confusión muestra lo siguiente:
+
+- **Verdaderos negativos (121)**: casos correctamente clasificados como no migrantes.
+- **Falsos negativos (14)**: casos en los que el modelo predijo incorrectamente no migrante cuando la clase real era migrante.
+- **Falsos positivos (4)**: casos en los que el modelo predijo incorrectamente migrante cuando la clase real era no migrante.
+- **Verdaderos positivos (0)**: no se detectaron casos positivos correctamente.
+
+El modelo tiene un buen rendimiento en la predicción de la clase negativa, pero presenta una deficiencia notable al no detectar correctamente los casos positivos, lo que puede ser una área de mejora.
+
+---
+
+
+
+
+
+
+
+
+
+
+
+# Factores sociales y remesas
+
+En este bloque se realizará el estudio con las variables relacionadas con los factores sociales y el impacto de las remesas. Las variables a analizar son:  
+
+- **RED1**: presencia de miembros del hogar que residen en el extranjero.  
+- **REDPADRE**: padre viviendo fuera del país.  
+- **REDMADRE**: madre viviendo fuera del país.  
+- **REDESPOSO**: cónyuge viviendo fuera del país.  
+- **REDHERMANO**: hermanos/as viviendo fuera del país.  
+- **REDHIJO**: hijos/as viviendo fuera del país.  
+- **REDOTRO1**: otros parientes viviendo fuera del país.  
+- **REDOTRO2**: personas no parientes viviendo fuera del país.  
+- **CFinREM1**: recepción de remesas desde el extranjero en los últimos 12 meses.  
+- **CFinREM2**: frecuencia de recepción de remesas.
+- **CFinREMCOVID**: impacto de las remesas durante la pandemia de COVID-19.  
+
+Al igual que en el análisis anterior, se llevarán a cabo análisis de datos, análisis factorial, regresión logística, análisis discriminante y una red neuronal para identificar patrones y generar predicciones basadas en estas variables.
+
+```{r}
+current <- social_remesas
+```
+
+## Análisis de datos
+
+### Gráficas
+
+A continuación se muestran algunas gráficas que representan como se modela la población en las distintas variables y en función de la intención migratoria.
+
+```{r}
+aux <- remove_rows(current, rdoubts)
+```
+
+```{r}
+create_bar_chart(aux$RED1, IM, 
+  c(
+    "Si",
+    "No"
+  ),
+  "Diagrama de presencia de familiares en el extranjero y la intención de migrar",
+  "Presencia de familiares en el extranjero", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+
+create_bar_chart(aux$REDMADRE, IM, 
+  c(
+    "No",
+    "Si"
+  ),
+  "Diagrama de presencia de madre en el extranjero y la intención de migrar",
+  "Presencia de madre en el extranjero", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+
+create_bar_chart(aux$REDPADRE, IM, 
+  c(
+    "No",
+    "Si"
+  ),
+  "Diagrama de presencia de padre en el extranjero y la intención de migrar",
+  "Presencia de padre en el extranjero", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+
+
+create_bar_chart(aux$CFinREM1, IM,
+  c(
+    "Si",
+    "No",
+    "No sabe"
+  ),
+  "Diagrama de recepción de remeses en los últimos 12 meses y la intención de migrar",
+  "Recepción de remesas en los últimos 12 meses",
+  "Número de individuos",
+  "Intención de migrar"
+)
+```
+
+### Matriz de correlación
+
+A continuación se muestra un mapa de calor que representa la matriz de correlación de las variables que vamos a estudiar:
+
+```{r}
+plot_correlation_heatmap(current)
+```
+
+### Tests para la validación de datos
+
+#### Test de Kaiser-Meyer-Olkin (KMO)
+
+```{r}
+kmo_result <- KMO(current)
+
+print(kmo_result)
+```
+
+El MSA global es **0.36**, indicando que los datos no son adecuados para análisis factorial. Las variables con los valores más bajos de MSA y que se van a eliminar son:  
+
+- **REDOTRO1 (0.09)**: otros parientes viviendo fuera del país. 
+- **REDOTRO2 (0.02)**: personas no parientes viviendo fuera del país.  
+- **REDESPOSO (0.13)**: cónyuge viviendo fuera del país. 
+
+Estas variables tienen una correlación muy baja con las demás y afectan la calidad del análisis. Para mejorar el MSA global se opta por su eliminación.
+
+```{r}
+current <- remove_columns(current, c("REDOTRO1", "REDOTRO2", "REDESPOSO"))
+```
+
+```{r}
+kmo_result <- KMO(current)
+
+print(kmo_result)
+```
+
+El MSA global ha mejorado significativamente a **0.71**, indicando una adecuación moderada para el análisis factorial tras eliminar **REDOTRO1**, **REDOTRO2** y **REDESPOSO**.  
+
+#### Test de esfericidad de Bartlett
+
+```{r}
+cor_matrix <- cor(current)
+n <- nrow(current)
+bartlett_result <- cortest.bartlett(cor_matrix, n)
+
+print(bartlett_result)
+```
+
+El resultado obtenido es altamente significativo (χ² = **3262.289**, p < **0.001**), lo que confirma que las correlaciones entre las variables son estadísticamente significativas y adecuadas para este análisis.
+
+#### Comunalidades
+
+Primero vamos a proceder a la elección del número de factores con análisis factorial paralelo.
+
+```{r}
+eigenvalues <- fa.parallel(current, fa = "fa")
+```
+
+Calculamos las comunalidades con **4** factores.
+
+```{r}
+fa_temp <- fa(current, nfactors = 4, rotate = "varimax", fm = "ml")
+print(fa_temp$communality)
+
+low_communalities <- names(which(fa_temp$communality < 0.4))
+print(low_communalities)
+```
+
+En el análisis realizado, se identificaron dos variables con comunalidades bajas que no están bien representadas en el modelo factorial:
+
+- **REDPADRE (0.263)**: padre viviendo fuera del país.
+- **REDHIJO (0.390)**: hijos/as viviendo fuera del país.  
+
+Se procederá eliminar **REDPADRE**, ya que presenta la menor comunalidad y su contribución al modelo es limitada. 
+
+```{r}
+current <- remove_columns(current, c("REDPADRE"))
+```
+
+## Análisis factorial
+
+### Elección del número de factores
+
+Para determinar el número adecuado de factores, se realizó un análisis de componentes principales (PCA).
+
+```{r}
+pca_result <- prcomp(current, center = TRUE, scale. = TRUE)
+summary(pca_result)
+``` 
+
+Se ha optado por utilizar **3** factores debido a que con este número se explica un **80.42%** de la varianza.
+
+### Creación del modelo
+
+Con los **3** factores seleccionados, se realizó un análisis factorial de máxima verosimilitud, utilizando rotación varimax para simplificar la interpretación de los factores.
+
+```{r}
+fa_model <- fa(current, nfactors = 3, rotate = "varimax", fm = "ml")
+current <- as.data.frame(fa_model$scores)
+```
+
+### Interpretación del modelo
+
+Mostramos las cargas factoriales de las variables en cada uno de los cuatro factores obtenidos. Se va a utilizar un umbral de **0.3** para identificar las variables que contribuyen de manera significativa a cada factor:
+
+```{r}
+loadings <- as.matrix(fa_model$loadings[])
+loadings[abs(loadings) < 0.3] <- NA
+print(loadings, na.print = "", digits = 3)
+```
+
+A partir de las cargas factoriales, se identifican las siguientes dimensiones principales:
+
+- **ML2 (Remesas):**  este factor está dominado por **CFinREM1**, lo que sugiere una fuerte influencia negativa de la recepción de remesas. También incluye una contribución moderada de **CFinREMCOVID**, que indica un impacto de las remesas durante la pandemia. Este factor podría representar el papel de las remesas como un alivio económico, pero también como un indicador de dependencia económica del exterior.
+- **ML1 (Familia en el extranjero):**  este factor está definido principalmente por **REDHERMANO** y **RED1**. Sugiere que las conexiones familiares, particularmente con hermanos en el extranjero, son un componente importante de este factor. La contribución negativa de **RED1** puede reflejar la falta de redes locales en contraste con redes externas.
+- **ML3 (Bienestar):**  **CFinREMCOVID** y **REDMADRE** tienen una influencia significativa en este factor, indicando que el bienestar familiar y el apoyo emocional, en particular de la madre y la estabilidad de las remesas durante la pandemia, son componentes clave. Este factor refleja una percepción positiva de apoyo familiar y estabilidad económica.
+
+```{r}
+current <- rename_columns(current, c("Remesas", "Familia", "Bienestar"))
+```
+
+## Regresión logística binaria
+
+### Preparación de los datos
+
+Primero, se eliminan las filas correspondientes a individuos con intención migratoria indecisa.
+
+```{r}
+current <- remove_rows(current, rdoubts)
+```
+
+### Creación del modelo
+
+Creamos el modelo de regresión logística:
+
+```{r}
+logit_model <- glm(IM ~ ., data = current, family = binomial)
+logit_predictions <- predict(logit_model, type = "response")
+logit_classification <- ifelse(logit_predictions > 0.5, 1, 0)
+```
+
+### Interpretación del modelo
+
+```{r}
+summary(logit_model)
+```
+
+El modelo ajustado analiza la influencia de distintos factores en la intención migratoria (**IM**) utilizando el método de "Fisher Scoring" y alcanzó la convergencia en 4 iteraciones. Los resultados son los siguientes:
+
+- **Intercepto (-1.882)**: este coeficiente es altamente significativo (p < **2e-16**), lo que indica que, en ausencia de los factores explicativos, la probabilidad de intención migratoria es baja.
+- **Remesas (0.013)**: el coeficiente es positivo pero no estadísticamente significativo (p = **0.898**), lo que sugiere que la recepción de remesas no tiene un impacto relevante en la intención migratoria en este modelo.
+- **Familia en el extranjero (0.133)**: aunque el coeficiente es positivo, tampoco es significativo (p = **0.204**), lo que indica que las conexiones familiares en el extranjero no influyen de manera concluyente en la probabilidad de migrar.
+- **Bienestar (0.165)**: este coeficiente tiene un valor positivo y es marginalmente significativo (p = **0.093**). Esto sugiere una ligera evidencia de que una percepción más alta de bienestar podría estar asociada con una mayor intención migratoria, aunque no es concluyente.
+
+```{r}
+final$Bienestar <- current$Curiosidad_Oportunidades
+final$Familia <- current$Familia
+```
+
+### Validación del modelo  
+
+#### Prueba ómnibus  
+
+```{r}
+null_model <- glm(IM ~ 1, data = current, family = binomial)  
+anova(null_model, logit_model, test = "Chisq")  
+```  
+
+La diferencia en la deviance entre el modelo nulo y el modelo con predictores es pequeña y no estadísticamente significativa (p = **0.2319**). Esto sugiere que las variables predictoras (Remesas, Familia, Bienestar) no contribuyen significativamente al ajuste del modelo en comparación con el modelo nulo.  
+
+#### Pseudo-R² (R-cuadrado de McFadden)  
+
+```{r}
+pR2(logit_model)  
+```  
+
+El McFadden R² es **0.0078**, indicando que el modelo explica solo una fracción mínima de la variabilidad en la intención migratoria. Este valor refleja la limitada capacidad explicativa del modelo.  
+
+#### Prueba de Hosmer-Lemeshow  
+
+```{r}
+hoslem.test(IM, fitted(logit_model))  
+```  
+
+La prueba de Hosmer-Lemeshow da un p-valor de **0.7631**, indicando que no se rechaza la hipótesis nula de buen ajuste. Esto sugiere que, aunque el modelo es limitado en su capacidad explicativa, se ajusta razonablemente bien a los datos observados. 
+
+#### Curva ROC y AUC (Área Bajo la Curva)  
+
+```{r}
+roc_result <- roc(IM, fitted(logit_model))  
+plot(roc_result)  
+auc(roc_result)  
+```  
+
+El AUC es **0.5318**, apenas mejor que el azar (**0.5**), lo que evidencia que el modelo tiene una capacidad discriminativa muy baja para clasificar correctamente la intención migratoria.
+
+#### Precisión  
+
+```{r}
+accuracy(logit_classification, IM)  
+```  
+
+La precisión global del modelo es **86.68%**, pero este valor está influenciado por la alta proporción de casos sin intención migratoria. La precisión no refleja adecuadamente la capacidad del modelo para identificar casos positivos (intención de migrar). 
+
+#### Matriz de confusión  
+
+```{r}
+table(Predicted = logit_classification, Actual = IM)  
+```  
+
+El modelo clasifica correctamente **605** casos sin intención de migrar, pero solo identifica **93** casos con intención migratoria. Esto indica un claro sesgo hacia la categoría predominante, con una sensibilidad limitada para detectar casos positivos.  
+
+## Análisis discriminante
+
+### Creación del modelo
+
+Creamos el modelo de análisis discriminante:
+
+```{r}
+lda_model <- lda(IM ~ ., data = current)
+lda_predictions <- predict(lda_model)
+lda_classification <- ifelse(lda_predictions$class == 1, 1, 0)
+```
+
+### Interpretación del modelo
+
+A continuación, se muestra la importancia de cada factor en la determinanción de la clase por parte del análisis discriminante:
+
+```{r}
+lda_model$scaling
+```
+
+Los coeficientes de la función discriminante lineal **LD1** muestran cómo cada factor influye en la discriminación entre las clases:
+
+- **Familia en el extranjero (0.646)**: tiene una grá influencia positiva. Esto sugiere que los individuos con fuertes lazos familiares que viven en el extranjero tienen una mayor probabilidad de pertenecer a la clase con intención migratoria, posiblemente buscando mejorar las condiciones de vida de su familia.
+- **Bienestar (0.875)**: tiene la influencia más fuerte en la función discriminante. Una percepción de bienestar elevada está asociada con una mayor probabilidad de migrar, lo que podría reflejar una búsqueda de mejores oportunidades fuera del país para mejorar el bienestar general.
+- **Remesas (0.027)**: aunque este coeficiente es positivo, su impacto es mínimo. Esto sugiere que las remesas tienen una influencia marginal en la decisión de migrar, y podrían reflejar una relación más compleja que requiere un análisis más profundo.
+
+```{r}
+plot_LDA(lda_predictions$x, lda_classification)
+```
+
+En el gráfico se observa como la mayoría de las predicciónes son no migrante.
+
+### Validación del modelo  
+
+#### Lambda de Wilks  
+
+```{r}
+Wilks.test(IM ~ ., data = current, method = "c")  
+```  
+
+El valor de Lambda de Wilks es **0.99259** con un p-valor de **0.16**, lo que indica que no se pueden rechazar las hipótesi nula respecto a la diferencia significativa entre las medias de las variables predictoras entre las clases. El valor alto de la Lambda de WIlks sugiere que las variables utilizadas en el modelo no discriminan de manera significativa entre las clases de migrantes y no migrantes.
+
+#### Curva ROC y AUC (Área Bajo la Curva)  
+
+```{r}
+roc_result <- roc(IM, lda_predictions$posterior[,2])  
+plot(roc_result)  
+auc(roc_result)  
+```  
+
+El valor de AUC es **0.532**, lo que sugiere una capacidad discriminativa moderada. Aunque el modelo tiene un desempeño ligeramente mejor que el azar, sigue siendo limitado para predecir correctamente la intención migratoria.
+
+#### Precisión  
+
+```{r}
+accuracy(lda_classification, IM)  
+```  
+
+El modelo presenta una precisión del **86.82%**. Sin embargo, esta cifra refleja principalmente la alta proporción de casos de no migrantes, lo que puede distorsionar la evaluación real del rendimiento del modelo en cuanto a su capacidad para detectar migrantes.
+
+#### Matriz de confusión  
+
+```{r}
+table(Predicted = lda_classification, Actual = IM)  
+```  
+
+La matriz de confusión muestra:
+
+- **Verdaderos positivos (1)**: correcto al clasificar migrantes.
+- **Verdaderos negativos (605)**: correctos al clasificar a no migrantes.
+- **Falsos negativos (92)**: migrantes clasificados incorrectamente como no migrantes.
+
+El modelo tiene un sesgo hacia la categoría predominante de no migrantes, lo que limita su capacidad para identificar correctamente a los migrantes.
+
+## Red neuronal
+
+### Creación del modelo
+
+Para realizar la predicción de la variable dependiente (**IM**), se dividirán los datos en un **80%** para entrenamiento y un **20%** para pruebas. Se establecerá una red neuronal con **100** neuronas en una capa oculta, utilizando un esquema de salida lineal. Posteriormente, las predicciones continuas generadas se transformarán en clasificaciones binarias con un umbral de **0.5**, permitiendo identificar correctamente las clases objetivo. Este enfoque asegurará que el modelo aprenda patrones representativos de los datos de entrenamiento.
+
+```{r}
+trainIndex <- createDataPartition(IM, p = 0.8, list = FALSE)
+
+trainData <- current[trainIndex, ]
+testData <- current[-trainIndex, ]
+
+trainLabels <- IM[trainIndex]
+testLabels <- IM[-trainIndex]
+
+nn_model <- nnet(trainLabels ~ ., data = trainData, linout = TRUE, size = 100, trace = FALSE)
+nn_predictions <- predict(nn_model, testData)
+nn_classification <- ifelse(nn_predictions > 0.5, 1, 0)
+```
+
+### Interpretación del modelo
+
+```{r}
+plot_importance(nn_model, testData, testLabels)
+```
+
+El gráfico de importancia de variables muestra el peso relativo de cada predictor en la capacidad del modelo para clasificar entre migración y no migración. Los resultados indican lo siguiente:
+
+- **Remesas** tiene una contribución positiva y significativa hacia la clase de migración, representada por una barra azul larga. Esto sugiere que una mayor percepción de remesas está asociada con una mayor intención de migrar.
+- **Bienestar** muestra una leve contribución negativa hacia la migración.
+- **Familia en el extranjero** presenta un impacto negativo considerable, evidenciado por las barras rojas. Esto indica que mayores niveles de estas variables están más asociados con la clase de no migración.
+
+El análisis sugiere que factores como la recepción de remesas o la familia en el extranjero juegan un papel importante en la decisión.
+
+### Validación del modelo
+
+#### Error cuadrático medio (RMSE)
+
+```{r}
+rmse <- sqrt(mean((nn_classification - testLabels)^2))
+rmse
+```
+
+El RMSE (Error Cuadrático Medio) es **0.3697**, lo que sugiere que la diferencia promedio entre las predicciones y los valores reales es relativamente baja. Este nivel de error es aceptable y refleja que el modelo tiene una buena capacidad para hacer predicciones precisas. Sin embargo, siempre hay margen para mejorar la exactitud de las predicciones.
+
+#### Precisión
+
+```{r}
+accuracy(nn_classification, testLabels)
+```
+
+La precisión del modelo es **86.33%**, lo que indica que el modelo clasifica correctamente la mayoría de los casos en el conjunto de prueba. Aunque el rendimiento es sólido, es importante validar su consistencia en diferentes conjuntos de datos y condiciones.
+
+#### Matriz de confusión
+
+```{r}
+table(Predicted = nn_classification, Actual = testLabels)
+```
+
+La matriz de confusión muestra:
+
+- **Verdaderos negativos (120)**: casos correctamente clasificados como no migrantes.
+- **Falsos negativos (18)**: casos en los que el modelo predijo incorrectamente no migrante cuando la clase real era migrante.
+- **Falsos positivos (1)**: casos en los que el modelo predijo incorrectamente migrante cuando la clase real era no migrante.
+- **Verdaderos positivos (0)**: no se detectaron casos positivos correctamente.
+
+Aunque el modelo es eficaz en la predicción de casos negativos, no logra identificar correctamente los casos positivos (migrantes), lo que sugiere que tiene un sesgo hacia la clase de no migrantes y requiere ajustes para mejorar la detección de la clase positiva.
+
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Factores pull y push
+
+En este bloque se realizará el estudio con las variables relacionadas con los factores de atracción (pull) y expulsión (push) que influyen en las decisiones de migración o movilidad. Las variables a analizar son:  
+
+- **AT1**: curiosidad por conocer otros países y culturas.  
+- **AT2**: percepción de mayor seguridad al vivir en otro país.  
+- **AT3**: expectativa de mejores oportunidades laborales en otro país.  
+- **AT4**: intención de emigrar para ayudar económicamente a la familia en Guatemala.  
+- **EX1**: percepción de discriminación en Guatemala.  
+- **EX2**: opinión sobre el machismo como problema en Guatemala.  
+- **EX3**: valoración negativa de la situación económica familiar.  
+- **EX4**: ingresos económicos insuficientes.  
+- **EX5**: impacto de la sequía en la pérdida de cosechas familiares.  
+- **EX6**: sensación de falta de valoración en la comunidad o municipio.  
+- **TRAN1**: temor a abusos durante el viaje hacia los Estados Unidos.  
+- **TRAN2**: miedo a ser detenido en Estados Unidos como motivo para no migrar.  
+- **TRAN3**: percepción de dificultades para encontrar trabajo en el extranjero.  
+- **TRAN4**: preferencia por no migrar debido al riesgo de contagio de COVID-19.  
+- **ARR1**: participación en actividades sociales de la comunidad.  
+- **ARR2**: apego a la familia en la comunidad.  
+- **ARR3**: apego a amigos y vecinos de la comunidad.  
+- **ARR4**: importancia de las personas cercanas en la comunidad.  
+- **ARR5**: percepción de apoyo comunitario para resolver problemas.  
+- **ARR6**: añoranza por la comunidad cuando se está fuera.  
+- **ARR7**: tristeza ante la posibilidad de mudarse.  
+- **ARR8**: preferencia por la comunidad como lugar de residencia.  
+- **ARR9**: pertenencia a comités comunitarios.  
+- **ARR10**: nivel de confianza en las personas de la comunidad.  
+
+Al igual que en los bloques anteriores, se realizarán análisis de datos, análisis factorial, regresión logística, análisis discriminante y una red neuronal para identificar patrones y generar predicciones basadas en estas variables.
+
+```{r}
+current <- pull_push
+```
+
+## Análisis de datos
+
+### Gráficas
+
+A continuación se muestran algunas gráficas que representan como se modela la población en las distintas variables y en función de la intención migratoria.
+
+```{r}
+aux <- remove_rows(current, rdoubts)
+```
+
+```{r}
+create_bar_chart(aux$AT1, IM, 
+  c(
+    "No",
+    "Indeciso",
+    "Si"
+  ),
+  "Diagrama de barras de la curiosidad por otras culturas y la intención de migrar",
+  "Curiosidad por otras culturas", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+
+create_bar_chart(aux$EX1, IM, 
+  c(
+    "No",
+    "Indeciso",
+    "Si"
+  ),
+  "Diagrama de barras de la percepción de discriminación en Guatemala y la intención de migrar", 
+  "Percepción de discriminación", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+
+create_bar_chart(aux$TRAN1, IM,
+  c(
+    "No",
+    "Indeciso",
+    "Si"
+  ),
+  "Diagrama del miedo a los abusos durante la migración a Estados unidos y la intención de migrar", 
+  "Miedo a los abusos durante la migración", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+
+create_bar_chart(aux$ARR1, IM, 
+  c(
+    "No",
+    "Indeciso",
+    "Si"
+  ),
+  "Diagrama de participación en actividades sociales de la comunidad y la intención de migrar", 
+  "Participación en actividades sociales", 
+  "Número de individuos", 
+  "Intención de migrar"
+)
+```
+
+### Matriz de correlación
+
+A continuación se muestra un mapa de calor que representa la matriz de correlación de las variables que vamos a estudiar:
+
+```{r}
+plot_correlation_heatmap(current)
+```
+
+### Tests para la validación de datos
+
+#### Test de Kaiser-Meyer-Olkin (KMO)
+
+```{r}
+kmo_result <- KMO(current)
+
+print(kmo_result)
+```
+
+El MSA global es **0.65**, lo que indica que los datos tienen una adecuación moderada para el análisis factorial. Las variables con los valores más bajos de MSA que se van a eliminar son:
+
+- **TRAN1 (0.52)**: temor a abusos durante el viaje hacia los Estados Unidos.   
+- **TRAN4 (0.52)**: preferencia por no migrar debido al riesgo de contagio de COVID-19. 
+- **EX5 (0.58)**: impacto de la sequía en la pérdida de cosechas familiares.  
+
+Estas variables tienen una correlación baja con las demás y afectan la calidad del análisis.
+
+```{r}
+current <- remove_columns(current, c("TRAN1", "TRAN4", "EX5"))
+```
+
+```{r}
+kmo_result <- KMO(current)
+
+print(kmo_result)
+```
+
+El MSA global ha mejorado significativamente a **0.67**, indicando una adecuación moderada para el análisis factorial tras eliminar **TRAN1**, **TRAN4** y **EX5**.
+
+#### Test de esfericidad de Bartlett
+
+```{r}
+cor_matrix <- cor(current)
+n <- nrow(current)
+bartlett_result <- cortest.bartlett(cor_matrix, n)
+
+print(bartlett_result)
+```
+
+El resultado obtenido es altamente significativo (χ² = **2411.254**, p < **0.001**), lo que confirma que las correlaciones entre las variables son estadísticamente significativas y adecuadas para este análisis.
+
+#### Comunalidades
+
+Primero vamos a proceder a la elección del número de factores con análisis factorial paralelo.
+
+```{r}
+eigenvalues <- fa.parallel(current, fa = "fa")
+```
+
+Calculamos las comunalidades con **5** factores.
+
+```{r}
+fa_temp <- fa(current, nfactors = 5, rotate = "varimax", fm = "ml")
+print(fa_temp$communality)
+
+low_communalities <- names(which(fa_temp$communality < 0.4))
+print(low_communalities)
+```
+
+A continuación, se identifican las variables con comunalidades bajas (menores a **0.4**):
+
+- **EX2 (0.086)**: opinión sobre el machismo como problema en Guatemala.
+- **TRAN3 (0.075)**: percepción de dificultades para encontrar trabajo en el extranjero.
+- **ARR9 (0.106)**: pertenencia a comités comunitarios.
+- **ARR10 (0.185)**: nivel de confianza en las personas de la comunidad.
+- **TRAN2 (0.170)**: miedo a ser detenido en Estados Unidos como motivo para no migrar.
+
+Estas variables no están bien representadas en el modelo factorial. Se procederá a eliminarlas para mejorar la calidad del análisis.
+
+```{r}
+current <- remove_columns(current, c("EX2", "TRAN3", "ARR9", "ARR10", "TRAN2"))
+```
+
+## Análisis factorial
+
+### Elección del número de factores
+
+Para determinar el número adecuado de factores, se realizó un análisis de componentes principales (PCA).
+
+```{r}
+pca_result <- prcomp(current, center = TRUE, scale. = TRUE)
+summary(pca_result)
+``` 
+
+Se ha optado por utilizar **5** factores debido a que con este número se explica un **54.41%** de la varianza.
+
+### Creación del modelo
+
+Con los **5** factores seleccionados, se realizó un análisis factorial de máxima verosimilitud, utilizando rotación varimax para simplificar la interpretación de los factores.
+
+```{r}
+fa_model <- fa(current, nfactors = 5, rotate = "varimax", fm = "ml")
+current <- as.data.frame(fa_model$scores)
+```
+
+### Interpretación del modelo
+
+Mostramos las cargas factoriales de las variables en cada uno de los cuatro factores obtenidos. Se va a utilizar un umbral de **0.3** para identificar las variables que contribuyen de manera significativa a cada factor:
+
+```{r}
+loadings <- as.matrix(fa_model$loadings[])
+loadings[abs(loadings) < 0.3] <- NA
+print(loadings, na.print = "", digits = 3)
+```
+
+A partir de las cargas factoriales obtenidas en el análisis, se identifican las siguientes dimensiones principales:
+
+- **ML1 (Curiosidad y oportunidades)**: este factor está principalmente dominado por las variables **AT3 (expectativa de mejores oportunidades laborales en otro país)** y **AT4 (intención de emigrar para ayudar económicamente a la familia en Guatemala)**.
+- **ML2 (Arraigo social)**: este factor incluye variables relacionadas con el arraigo social a la comunidad, la relación que el individuo establece con sus homónimos dentro de la comunidad.
+- **ML3 (Arraigo de proyectos)**: la mayoría de estos factores tienen que ver con la participación del individuo en proyectos comunitarios.
+- **ML4 (Economía)**: esta factor está formado por **EX3 (valoración negativa de la situación económica familiar)**
+ y **EX4 (ingresos económicos insuficientes)**. Ambas variables reflejan el malestar económico.
+- **ML5 (Malestar)**: este factor incluye las variables **EX1 (percepción de discriminación en Guatemala)** y **EX6 (sensación de falta de valoración en la comunidad o municipio)**. 
+
+```{r}
+current <- rename_columns(current, c("Curiosidad_Oportunidades", "Arraigo_Social", "Arraigo_Proyectos", "Economia", "Malestar"))
+```
+
+## Regresión logística binaria
+
+### Preparación de los datos
+
+Primero, eliminamos las filas correspondientes a individuos con intención migratoria indecisa.
+
+```{r}
+current <- remove_rows(current, rdoubts)
+```
+
+### Creación del modelo
+
+Creamos el modelo de regresión logística:
+
+```{r}
+logit_model <- glm(IM ~ ., data = current, family = binomial)
+logit_predictions <- predict(logit_model, type = "response")
+logit_classification <- ifelse(logit_predictions > 0.5, 1, 0)
+```
+
+### Interpretación del modelo
+
+```{r}
+summary(logit_model)
+```
+
+El modelo ajustado analiza la influencia de distintos factores en la intención migratoria (**IM**) utilizando el método de "Fisher Scoring" y alcanzó la convergencia en **4** iteraciones. Los resultados son los siguientes:
+
+- **Intercepto (-2.7062)**: este coeficiente es altamente significativo (p < **2e-16**), lo que indica que, en ausencia de los factores explicativos, la probabilidad de intención migratoria es baja.
+- **Curiosidad y oportunidades (2.1076)**: este coeficiente es positivo y altamente significativo (p < **0.001**), lo que sugiere que los individuos con mayores expectativas de oportunidades fuera del país tienen una mayor probabilidad de migrar.
+- **Arraigo social (0.1074)**: este coeficiente no es significativo (p = **0.4901**), lo que indica que, aunque se podría suponer que el arraigo social influencian la migración, este modelo no muestra una relación clara.
+- **Arraigo de proyectos (-0.2645)**: este coeficiente es negativo y marginalmente significativo (p = **0.0356**), lo que sugiere que estos factores pueden disminuir la probabilidad de migrar.
+- **Economía (-0.1343)**: este coeficiente no es significativo (p = **0.4180**), lo que indica que la economía no influye de manera importante en la decisión de migrar.
+- **Malestar (0.3499)**: este coeficiente es marginalmente significativo (p = **0.0513**), lo que sugiere que el malestar percibido podría tener un leve impacto en la decisión.
+
+```{r}
+final$Curiosidad_Oportunidades <- current$Curiosidad_Oportunidades
+final$Arraigo_Proyectos <- current$Arraigo_Proyectos
+final$Malestar <- current$Malestar
+```
+
+### Validación del modelo
+
+#### Prueba Ómnibus
+
+```{r}
+null_model <- glm(IM ~ 1, data = current, family = binomial)  
+anova(null_model, logit_model, test = "Chisq")  
+```  
+
+La diferencia en la deviance entre el modelo nulo y el modelo con predictores es estadísticamente significativa (p < **2.2e-16**), lo que sugiere que al menos una de las variables predictoras contribuye al modelo.
+
+#### Pseudo-R² (R-cuadrado de McFadden)
+
+```{r}
+pR2(logit_model)  
+```  
+
+El McFadden R² es **0.162**, lo que indica que el modelo explica aproximadamente el **16.2%** de la variabilidad en la intención migratoria.
+
+#### Prueba de Hosmer-Lemeshow
+
+```{r}
+hoslem.test(IM, fitted(logit_model))  
+```  
+
+La prueba de Hosmer-Lemeshow da un p-valor de **0.0008158**, lo que sugiere que el modelo podría tener un ajuste pobre en algunos rangos de los datos, ya que rechaza la hipótesis nula de un buen ajuste.
+
+#### Curva ROC y AUC (Área Bajo la Curva)
+
+```{r}
+roc_result <- roc(IM, fitted(logit_model))  
+plot(roc_result)  
+auc(roc_result)  
+```  
+
+El AUC es **0.7818**, lo que sugiere que el modelo tiene una capacidad discriminativa bastante buena.
+
+#### Precisión
+
+```{r}
+accuracy(logit_classification, IM)  
+```  
+
+La precisión global del modelo es **86.82%**, lo que indica un rendimiento aceptable en términos generales.
+
+#### Matriz de confusión
+
+```{r}
+table(Predicted = logit_classification, Actual = IM)  
+```  
+
+El modelo clasifica correctamente **605** casos sin intención de migrar, pero solo identifica **93** casos con intención migratoria. Esto refleja un sesgo hacia la clase de no migrantes.
+
+## Análisis discriminante
+
+### Creación del modelo
+
+Creamos el modelo de análisis discriminante:
+
+```{r}
+lda_model <- lda(IM ~ ., data = current)
+lda_predictions <- predict(lda_model)
+lda_classification <- ifelse(lda_predictions$class == 1, 1, 0)
+```
+
+### Interpretación del modelo
+
+A continuación, se muestra la importancia de cada factor en la determinación de la clase por parte del análisis discriminante:
+
+```{r}
+lda_model$scaling
+```
+
+Los coeficientes de la función discriminante lineal **LD1** muestran cómo cada factor influye en la discriminación entre las clases:
+
+- **Curiosidad y oportunidades (1.0087)**: tiene una fuerte influencia positiva en la decisión de migrar.
+- **Arraigo social (0.1243)**: tiene una influencia positiva marginal.
+- **Arraigo de proyectos (-0.3583)**: tiene una influencia negativa moderada.
+- **Economía (-0.0902)**: tiene una influencia mínima en la discriminación.
+- **Malestar (0.4438)**: tiene una influencia positiva moderada en la decisión de migrar.
+
+A continuación vamos a pintar un gráfico de la clasificación realizada por el análisis discriminante:
+
+```{r}
+plot_LDA(lda_predictions$x, lda_classification)
+```
+
+En el gráfico se puede ver como prácticamente el todas las clasificiaciones son no migrantes.
+
+### Validación del modelo
+
+#### Lambda de Wilks
+
+```{r}
+Wilks.test(IM ~ ., data = current, method = "c")  
+```  
+
+El valor de Lambda de Wilks es **0.9124** con un p-valor de **2.212e-12**, indicando que las variables predictoras no discriminan significativamente entre las clases.
+
+#### Curva ROC y AUC (Área Bajo la Curva)
+
+```{r}
+roc_result <- roc(IM, lda_predictions$posterior[,2])  
+plot(roc_result)  
+auc(roc_result)  
+```  
+
+El AUC es **0.7767**, lo que sugiere una capacidad discriminativa moderada.
+
+#### Precisión
+
+```{r}
+accuracy(lda_classification, IM)  
+```  
+
+La precisión del modelo es **86.82%**.
+
+#### Matriz de confusión
+
+```{r}
+table(Predicted = lda_classification, Actual = IM)  
+```  
+
+La matriz de confusión muestra un rendimiento similar al de la regresión logística, con un sesgo hacia la clasificación de no migrantes.
+
+## Red neuronal
+
+### Creación del modelo
+
+Para realizar la predicción de la variable dependiente (**IM**), se dividirán los datos en un **80%** para entrenamiento y un **20%** para pruebas. Se establecerá una red neuronal con **100** neuronas en una capa oculta, utilizando un esquema de salida lineal. Posteriormente, las predicciones continuas generadas se transformarán en clasificaciones binarias con un umbral de **0.5**, permitiendo identificar correctamente las clases objetivo. Este enfoque asegurará que el modelo aprenda patrones representativos de los datos de entrenamiento.
+
+```{r}
+trainIndex <- createDataPartition(IM, p = 0.8, list = FALSE)
+
+trainData <- current[trainIndex, ]
+testData <- current[-trainIndex, ]
+
+trainLabels <- IM[trainIndex]
+testLabels <- IM[-trainIndex]
+
+nn_model <- nnet(trainLabels ~ ., data = trainData, linout = TRUE, size = 100, trace = FALSE)
+nn_predictions <- predict(nn_model, testData)
+nn_classification <- ifelse(nn_predictions > 0.5, 1, 0)
+```
+
+### Interpretación del modelo
+
+```{r}
+plot_importance(nn_model, testData, testLabels)
+```
+
+El gráfico de importancia de variables muestra el peso relativo de cada predictor en la capacidad del modelo para clasificar entre migración y no migración. Los resultados indican lo siguiente:
+
+- **Curiosidad y oportunidades** tiene una contribución positiva y significativa hacia la clase de migración, representada por una barra azul larga. Esto sugiere que una mayor curiosidad y percepción de oportunidades está asociada con una mayor intención de migrar.
+- **Arraigo social** en el entorno también muestra una leve contribución positiva hacia la migración, aunque con un impacto mucho menor en comparación con el factor anterior.
+- **Malestar**, **arraigo de proyectos**, y **economía** presentan un impacto negativo considerable, evidenciado por las barras rojas. Esto indica que mayores niveles de estas variables están más asociados con la clase de no migración.
+
+El análisis es acertado en la intuición lógica pues aquellos factores push son los que tienen una tendencia a indicar la migración, mientras que los factores pull definen la no migración.
+
+### Validación del modelo
+
+#### Error cuadrático medio (RMSE)
+```{r}
+rmse <- sqrt(mean((nn_classification - testLabels)^2))
+rmse
+```
+
+El RMSE es **0.4646**, lo que sugiere que la diferencia promedio entre las predicciones y los valores reales es relativamente baja.
+
+#### Precisión
+
+```{r}
+accuracy(nn_classification, testLabels)
+```
+
+La precisión del modelo es **78.42%**, inferior a la del análisis discriminante y la regresión logística binaria.
+
+#### Matriz de confusión
+
+```{r}
+table(Predicted = nn_classification, Actual = testLabels)
+```
+
+La matriz de confusión muestra un rendimiento similar al de los otros modelos, con un sesgo hacia la clase de no migrantes.
+
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Análisis con los factores más importantes
+
+Para este último bloque se ha hecho un estudio más reducido sobre los factores con mayor significancia de los bloques anteriores. Se han tomado aquellos que tenían p-valor por debajo de $0.25$. Estos son:
+
+- **Capital humano**: incluye variables de alfabetización y nivel de estudios.
+- **Género y ocupación**: formado por el género y la vocación que ejerce.
+- **Religión**: es una combinación de la religión que sigue y la importancia de la misma.
+- **Creatividad y optimismo**: incluye factores relacionados con la imaginación y del optimismo frente a la cosas.
+- **Control externo**: incluye variables respecto a cómo afectan los factores externos a nuestra vida.
+- **Autoeficacia**: indica cómo de resolutivo es la persona frente a problemas.
+- **Familia en el extranjero**: como bien dice su nombre, es un factor que cuantifica las redes familiares que tienen los individuos en el extranjero. 
+- **Curiosidad y oportunidades**: búsqueda de mejores condiciones laborales y curiosidad por otras culturas.
+- **Arraigo de proyectos**: indica la participación y conocimiento de proyectos en la comunidad.
+- **Malestar**: indica la sensación de malestar en Guatemala, ya sea discriminatoria o de otro tipo.
+
+
+```{r}
+current <- final
+```
+
+## Regresión logística binaria
+
+### Creación del modelo
+
+Creamos el modelo de regresión logística:
+
+```{r}
+logit_model <- glm(IM ~ ., data = current, family = binomial)
+logit_predictions <- predict(logit_model, type = "response")
+logit_classification <- ifelse(logit_predictions > 0.5, 1, 0)
+```
+
+### Interpretación del modelo
+
+```{r}
+summary(logit_model)
+```
+
+El modelo ajustado analiza la influencia de distintos factores en la intención migratoria (**IM**) utilizando el método de "Fisher Scoring" y alcanzó la convergencia en **7** iteraciones. Los resultados son los siguientes:
+
+- **Intercepto (-2.8081)**: este coeficiente es altamente significativo (p < **2e-16**), lo que indica que, en ausencia de los factores explicativos, la probabilidad de intención migratoria es baja.
+- **Capital Humano (-0.4096)**: este coeficiente es significativo (p = **0.0127**), indicando que a mayor capital humano, menor es la intención migratoria.
+- **Género y Ocupación (-0.3535)**: este coeficiente también es significativo (p = **0.0149**), sugiriendo un impacto negativo sobre la intención migratoria.
+- **Religión (0.0686)**: no significativo (p = **0.5943**).
+- **Creatividad y Optimismo (0.3339)**: marginalmente significativo (p = **0.0987**), mostrando una influencia positiva en la intención de migrar.
+- **Control Externo (-0.5173)**: significativo (p = **0.0081**), con un efecto negativo considerable en la intención migratoria.
+- **Curiosidad y Oportunidades (1.9515)**: altamente significativo (p < **0.001**), sugiriendo que mayores expectativas de oportunidades fuera del país incrementan la intención de migrar.
+- **Arraigo de Proyectos (-0.2335)**: marginalmente significativo (p = **0.0732**), lo que indica una influencia negativa moderada en la intención migratoria.
+- **Malestar (0.5779)**: significativo (p = **0.0028**), mostrando una influencia positiva considerable en la intención de migrar.
+
+### Validación del modelo
+
+#### Prueba Ómnibus
+
+```{r}
+null_model <- glm(IM ~ 1, data = current, family = binomial)  
+anova(null_model, logit_model, test = "Chisq")  
+```  
+
+La diferencia en la deviance entre el modelo nulo y el modelo con predictores es estadísticamente significativa (p < **2.2e-16**), lo que sugiere que al menos una de las variables predictoras contribuye al modelo.
+
+#### Pseudo-R² (R-cuadrado de McFadden)
+
+```{r}
+pR2(logit_model)  
+```  
+
+El McFadden R² es **0.206**, indicando que el modelo explica aproximadamente el **20.6%** de la variabilidad en la intención migratoria.
+
+#### Prueba de Hosmer-Lemeshow
+
+```{r}
+hoslem.test(IM, fitted(logit_model))  
+```  
+
+La prueba de Hosmer-Lemeshow da un p-valor de **0.0022**, lo que sugiere que el modelo podría tener un ajuste pobre en algunos rangos de los datos, ya que rechaza la hipótesis nula de un buen ajuste.
+
+#### Curva ROC y AUC (Área Bajo la Curva)
+
+```{r}
+roc_result <- roc(IM, fitted(logit_model))  
+plot(roc_result)  
+auc(roc_result)  
+```  
+
+El AUC es **0.8184**, lo que sugiere que el modelo tiene una capacidad discriminativa bastante buena.
+
+#### Precisión
+
+```{r}
+accuracy(logit_classification, IM)  
+```  
+
+La precisión global del modelo es **86.82%**, lo que indica un rendimiento aceptable en términos generales.
+
+#### Matriz de confusión
+
+```{r}
+table(Predicted = logit_classification, Actual = IM)  
+```  
+
+El modelo clasifica correctamente **599** casos sin intención de migrar y **7** casos con intención migratoria. Esto refleja un sesgo hacia la clase de no migrantes.
+
+## Análisis discriminante
+
+### Creación del modelo
+
+Creamos el modelo de análisis discriminante:
+
+```{r}
+lda_model <- lda(IM ~ ., data = current)
+lda_predictions <- predict(lda_model)
+lda_classification <- ifelse(lda_predictions$class == 1, 1, 0)
+```
+
+### Interpretación del modelo
+
+A continuación, se muestra la importancia de cada factor en la determinación de la clase por parte del análisis discriminante:
+
+```{r}
+lda_model$scaling
+```
+
+Los coeficientes de la función discriminante lineal **LD1** muestran cómo cada factor influye en la discriminación entre las clases:
+
+- **Capital Humano (-0.3246)**: influencia negativa significativa.
+- **Género y Ocupación (-0.2777)**: influencia negativa moderada.
+- **Religión (0.0382)**: influencia mínima positiva.
+- **Creatividad y Optimismo (0.2570)**: influencia positiva moderada.
+- **Control Externo (-0.4777)**: influencia negativa considerable.
+- **Autoeficacia (0.1786)**: influencia positiva menor.
+- **Familia en el extranjero (0.0543)**: influencia positiva marginal.
+- **Curiosidad y Oportunidades (0.7548)**: influencia positiva fuerte.
+- **Arraigo de Proyectos (-0.2922)**: influencia negativa moderada.
+- **Malestar (0.5694)**: influencia positiva moderada.
+
+```{r}
+plot_LDA(lda_predictions$x, lda_classification)
+```
+
+Es la primera vez que en el gráfico del análisis discriminante se pueden apreciar la categoría de migrantes. Aunque, esta supone una pequeña parte frente a la otra, va en correlación con la muestra.
+
+### Validación del modelo
+
+#### Lambda de Wilks
+
+```{r}
+Wilks.test(IM ~ ., data = current, method = "c")  
+```  
+
+El valor de Lambda de Wilks es **0.8827** con un p-valor de **3.009e-14**, indicando que las variables predictoras tienen un impacto significativo en la discriminación entre las clases.
+
+#### Curva ROC y AUC (Área Bajo la Curva)
+
+```{r}
+roc_result <- roc(IM, lda_predictions$posterior[,2])  
+plot(roc_result)  
+auc(roc_result)  
+```  
+
+El AUC es **0.8073**, lo que sugiere una capacidad discriminativa moderada.
+
+#### Precisión
+
+```{r}
+accuracy(lda_classification, IM)  
+```  
+
+La precisión del modelo es **86.96%**, la mejor de todos los modelos estadísticos a lo largo de este estudio.
+
+#### Matriz de confusión
+
+```{r}
+table(Predicted = lda_classification, Actual = IM)  
+```  
+
+El modelo clasifica correctamente **602** casos sin intención de migrar y **5** con intención migratoria, mostrando un rendimiento similar al de la regresión logística.
